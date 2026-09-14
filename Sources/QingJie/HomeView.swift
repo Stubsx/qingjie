@@ -3,6 +3,7 @@ import QingJieCore
 
 struct HomeView: View {
     @ObservedObject var state: AppState
+    @ObservedObject var update: UpdateSettings = .shared
     let hotKeys: HotKeys
     var appearance: ScreenshotAppearanceSettings = .shared
     var body: some View {
@@ -68,6 +69,15 @@ struct HomeView: View {
                 }.foregroundStyle(Theme.secondary)
             }.buttonStyle(.plain).padding(.top, 22)
             Text("轻截 \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "开发版")  /  为专注而做").font(.system(size: 9)).foregroundStyle(Theme.secondary.opacity(0.7)).padding(.top, 11)
+            if update.updateAvailable == true, let latest = update.latest, !update.isSkipped(latest) {
+                Button { state.page = .settings } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "arrow.up.circle.fill").font(.system(size: 11)).foregroundStyle(.orange)
+                        Text("新版本 \(latest.version) · 去更新").font(.system(size: 10, weight: .medium))
+                    }.foregroundStyle(Theme.secondary)
+                }.buttonStyle(.plain).padding(.top, 7)
+                .accessibilityLabel("发现新版本 \(latest.version)，前往设置下载安装")
+            }
         }.padding(22).frame(width: 200).background(.white)
     }
     private var hero: some View {

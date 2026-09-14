@@ -45,9 +45,6 @@ import QingJieCore
         hotKeys.onTrigger = { [weak self] in self?.captureService.capture($0 == .region ? .region : .fullscreen) }
         hotKeys.onChange = { [weak self] in self?.refreshShortcutPresentation() }
         hotKeys.register()
-        UpdateSettings.shared.onUpdateFound = { [weak self] info in
-            self?.state.notice = "发现新版本 \(info.version)：可在「设置 → 通用」下载安装。"
-        }
         UpdateSettings.shared.startAutomaticChecks()
         homeWindow = makeWindow(title: "轻截 · 工作台", size: NSSize(width: 1040, height: 740), content: HomeView(state: state, hotKeys: hotKeys))
         homeWindow.delegate = self
