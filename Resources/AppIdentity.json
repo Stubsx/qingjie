@@ -1,0 +1,10 @@
+{
+  "bundleIdentifier": "com.local.qingjie",
+  "appName": "轻截",
+  "executable": "QingJie",
+  "installPath": "/Applications/轻截.app",
+  "signingProfile": "local",
+  "certificateName": "QingJie Local Code Signing",
+  "certificateSHA1": "F4ADC4B0809251EA92E51676C541D0CD31B332C7",
+  "archiveName": "qingjie-macOS-arm64"
+}

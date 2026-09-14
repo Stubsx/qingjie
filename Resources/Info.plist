@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>CFBundleName</key><string>轻截</string>
+    <key>CFBundleDisplayName</key><string>轻截</string>
+    <key>CFBundleExecutable</key><string>QingJie</string>
+    <key>CFBundleIdentifier</key><string>com.local.qingjie</string>
+    <key>CFBundleVersion</key><string>25</string>
+    <key>CFBundleShortVersionString</key><string>0.6.16</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
+    <key>LSMinimumSystemVersion</key><string>14.0</string>
+    <key>NSHighResolutionCapable</key><true/>
+    <key>NSScreenCaptureUsageDescription</key><string>轻截需要屏幕录制权限来截取你选择的屏幕区域，截图仅保存在本机。</string>
+    <key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>
+</dict></plist>
