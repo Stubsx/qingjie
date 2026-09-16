@@ -20,17 +20,24 @@
 
 ```bash
 ./scripts/build.sh
-# 通过应用界面退出轻截，随后安装；安装脚本会检查是否仍在运行。
+# 构建签名成功后自动替换 /Applications/轻截.app：
+# 正在运行的轻截会先优雅退出，替换完成后自动重启。
+./scripts/build.sh --no-install
+# 仅构建 dist 成品（如打包发布前）；手动安装用 install.sh。
 ./scripts/install.sh
-# 日常从访达「应用程序」打开轻截，不要运行 dist 中的副本。
+# 手动安装更新；会检查应用是否已退出。
 python3 scripts/app_identity.py package
 # 发布应用内更新：上传压缩包后生成并发布更新源
 python3 scripts/app_identity.py feed --package-url <压缩包 https 地址>
 # 或用 gh CLI 直接上传 GitHub Release 并自动推导下载地址
-python3 scripts/app_identity.py publish --github-repo <owner/repo>   # 需要 QINGJIE_GIST_TOKEN
+python3 scripts/app_identity.py publish --github-repo <owner/repo>   # gh 登录含 gist 权限，或 QINGJIE_GIST_TOKEN
 ```
 
-构建时先生成完整临时应用，签名和身份校验成功后才替换 dist 成品。构建还会把证书指纹写入 Info.plist（`QingJieCertificateSHA1`），应用内更新用它校验下载包身份。安装时同样先校验新旧身份，应用未退出、证书丢失、身份不匹配或签名损坏都会停止，不会回退临时签名或覆盖身份不同的已安装应用。打包只包含签名后的 `.app`，并核对压缩包中的二进制和 Info.plist。
+构建时先生成完整临时应用，签名和身份校验成功后才替换 dist 成品。构建还会把证书指纹写入 Info.plist（`QingJieCertificateSHA1`），应用内更新用它校验下载包身份。构建成功后自动替换当前安装：先向正在运行的轻截发送退出事件（首次可能需要允许终端的自动化控制授权），再按 install 流程整体替换并重启。安装时同样先校验新旧身份，应用未退出、证书丢失、身份不匹配或签名损坏都会停止，不会回退临时签名或覆盖身份不同的已安装应用。打包只包含签名后的 `.app`，并核对压缩包中的二进制和 Info.plist。
+
+每次修改发布内容都应递增版本/build，并使用新的 Release 标签。上传的文件名包含版本、build 和 SHA-256 前缀；同一 Release 已有不同安装包时脚本会停止，禁止覆盖旧文件。重复发布完全相同的包会复用既有资产。写入更新源前还会验证压缩包对应当前构建，并核对 GitHub 返回的大小与 SHA-256；手动指定 `--package-url` 时也必须使用不会被覆盖的下载地址。
+
+客户端在点击「下载并安装」时重新获取更新源，避免使用此前检查时保留的旧校验值。版本检查请求绕过缓存，下载先检查 HTTP 状态，再核对文件大小、SHA-256 与固定签名。更新信息无法刷新或任何校验失败都会停止安装。
 
 运行时检测相同 Bundle ID 的其他实例，重复启动会转到已有实例，避免多份应用争抢全局快捷键。快捷键偏好和历史目录沿用旧版。
 

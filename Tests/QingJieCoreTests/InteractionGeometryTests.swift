@@ -13,40 +13,46 @@ final class InteractionGeometryTests: XCTestCase {
         XCTAssertNil(InteractionGeometry.resizeHandle(at: CGPoint(x: 90, y: 100), rect: rect))
         XCTAssertNil(InteractionGeometry.resizeHandle(at: CGPoint(x: 300, y: 250), rect: rect))
     }
-    func testEveryEdgeChangesOnlyItsOwnAxisEvenWithShift() {
+    func testEdgeDragMovesWholeRectangle() {
         let rect = CGRect(x: 100, y: 100, width: 400, height: 300), bounds = CGRect(x: 0, y: 0, width: 800, height: 700)
         let cases: [(RectEdge, CGPoint, CGRect)] = [
-            (.top, CGPoint(x: 10, y: 60), CGRect(x: 100, y: 60, width: 400, height: 340)),
-            (.bottom, CGPoint(x: 790, y: 450), CGRect(x: 100, y: 100, width: 400, height: 350)),
-            (.left, CGPoint(x: 50, y: 690), CGRect(x: 50, y: 100, width: 450, height: 300)),
-            (.right, CGPoint(x: 550, y: 0), CGRect(x: 100, y: 100, width: 450, height: 300))
+            (.top, CGPoint(x: 130, y: 80), CGRect(x: 130, y: 80, width: 400, height: 300)),
+            (.bottom, CGPoint(x: 60, y: 240), CGRect(x: 60, y: 240, width: 400, height: 300)),
+            (.left, CGPoint(x: 220, y: 130), CGRect(x: 220, y: 130, width: 400, height: 300)),
+            (.right, CGPoint(x: 90, y: 40), CGRect(x: 90, y: 40, width: 400, height: 300))
         ]
         for (edge, point, expected) in cases {
             for shift in [false, true] {
                 XCTAssertEqual(InteractionGeometry.resize(rect, handle: .edge(edge), to: point, bounds: bounds, square: shift), expected)
             }
         }
+        XCTAssertEqual(InteractionGeometry.resize(rect, handle: .edge(.top), to: rect.origin, bounds: bounds), rect)
     }
-    func testEdgeResizeClipsAndCrossesOppositeEdge() {
-        let rect = CGRect(x: 100, y: 100, width: 400, height: 300), bounds = CGRect(x: 0, y: 0, width: 800, height: 700)
-        XCTAssertEqual(InteractionGeometry.resize(rect, handle: .edge(.left), to: CGPoint(x: -50, y: 50), bounds: bounds),
-                       CGRect(x: 0, y: 100, width: 500, height: 300))
-        XCTAssertEqual(InteractionGeometry.resize(rect, handle: .edge(.bottom), to: CGPoint(x: 900, y: 900), bounds: bounds),
-                       CGRect(x: 100, y: 100, width: 400, height: 600))
-        XCTAssertEqual(InteractionGeometry.resize(rect, handle: .edge(.right), to: CGPoint(x: 70, y: 10), bounds: bounds),
-                       CGRect(x: 70, y: 100, width: 30, height: 300))
-        XCTAssertEqual(InteractionGeometry.resize(rect, handle: .edge(.top), to: CGPoint(x: 0, y: 430), bounds: bounds),
-                       CGRect(x: 100, y: 400, width: 400, height: 30))
+    func testOverlappingCornerBandsChooseNearestCorner() {
+        for size in [CGSize(width: 12, height: 12), CGSize(width: 12, height: 100), CGSize(width: 100, height: 12)] {
+            let rect = CGRect(origin: CGPoint(x: 100, y: 100), size: size)
+            for corner in RectCorner.allCases {
+                let point = corner.point(in: rect)
+                XCTAssertEqual(InteractionGeometry.resizeHandle(at: point, rect: rect), .corner(corner))
+                let inward = CGPoint(x: point.x + (point.x < rect.midX ? 2 : -2),
+                                     y: point.y + (point.y < rect.midY ? 2 : -2))
+                XCTAssertEqual(InteractionGeometry.resizeHandle(at: inward, rect: rect), .corner(corner))
+            }
+        }
     }
-    func testEdgeMinimumDoesNotJumpBackToOriginalSize() {
+    func testCornerToEdgeTransitionHasNoGap() {
+        let rect = CGRect(x: 100, y: 100, width: 400, height: 300)
+        XCTAssertEqual(InteractionGeometry.resizeHandle(at: CGPoint(x: 109, y: 104), rect: rect), .corner(.topLeft))
+        XCTAssertEqual(InteractionGeometry.resizeHandle(at: CGPoint(x: 109.1, y: 104), rect: rect), .edge(.top))
+        XCTAssertEqual(InteractionGeometry.resizeHandle(at: CGPoint(x: 496, y: 109), rect: rect), .corner(.topRight))
+        XCTAssertEqual(InteractionGeometry.resizeHandle(at: CGPoint(x: 496, y: 109.1), rect: rect), .edge(.right))
+    }
+    func testEdgeMoveClampsToScreenBounds() {
         let rect = CGRect(x: 100, y: 100, width: 400, height: 300), bounds = CGRect(x: 0, y: 0, width: 800, height: 700)
-        XCTAssertEqual(InteractionGeometry.resize(rect, handle: .edge(.right), to: CGPoint(x: 101, y: 300), bounds: bounds),
-                       CGRect(x: 100, y: 100, width: 3, height: 300))
-        XCTAssertEqual(InteractionGeometry.resize(rect, handle: .edge(.top), to: CGPoint(x: 250, y: 400), bounds: bounds),
-                       CGRect(x: 100, y: 397, width: 400, height: 3))
-        let onBoundary = CGRect(x: 0, y: 0, width: 50, height: 50)
-        XCTAssertEqual(InteractionGeometry.resize(onBoundary, handle: .edge(.right), to: CGPoint(x: -10, y: 10), bounds: bounds),
-                       CGRect(x: 0, y: 0, width: 3, height: 50))
+        XCTAssertEqual(InteractionGeometry.resize(rect, handle: .edge(.top), to: CGPoint(x: -50, y: -50), bounds: bounds),
+                       CGRect(x: 0, y: 0, width: 400, height: 300))
+        XCTAssertEqual(InteractionGeometry.resize(rect, handle: .edge(.right), to: CGPoint(x: 900, y: 900), bounds: bounds),
+                       CGRect(x: 400, y: 400, width: 400, height: 300))
     }
     func testEveryCornerKeepsOppositeAnchor() {
         let rect = CGRect(x: 200, y: 200, width: 200, height: 200), bounds = CGRect(x: 0, y: 0, width: 1000, height: 800)

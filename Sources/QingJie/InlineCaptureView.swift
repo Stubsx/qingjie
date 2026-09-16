@@ -29,6 +29,7 @@ final class InlineCaptureView: NSView {
     private var changes: AnyCancellable?
     private var refreshScheduled = false
     private var monitor: Any?
+    private var cursorTracking: NSTrackingArea?
     override var isFlipped: Bool { true }
 
     init(screenshot: CGImage, crop: CGImage, selection: CGRect, size: CGSize, appearance: ScreenshotAppearance = .init(),
@@ -37,16 +38,20 @@ final class InlineCaptureView: NSView {
         self.captureAppearance = appearance
         model = EditorModel(image: crop); model.tool = .rectangle
         model.captureSelection = selection
-        model.message = "拖动边线或四角调整选区 · 触碰标注即可拖动 · Enter 复制 · ⌘S 另存为"
+        model.message = "拖动四角调整大小，边线移动选区 · 触碰标注即可拖动 · Enter 复制 · ⌘S 另存为"
         canvas = AnnotationCanvas(model: model)
         super.init(frame: CGRect(origin: .zero, size: size))
         canvas.drawsBackdrop = false; addSubview(canvas)
+        // 框选完成后回到普通箭头；十字线只属于框选阶段和绘制中的画笔。
+        canvas.crosshairForTools = false
         canvas.wantsLayer = true; canvas.layer?.masksToBounds = true
         canvas.layer?.cornerRadius = captureAppearance.roundedCorners ? captureAppearance.cornerRadius : 0
         addSubview(resizeHandles)
         resizeHandles.onBegin = { [weak self] in self?.beginResize($0) }
         resizeHandles.onDrag = { [weak self] in self?.resize(to: $0, square: $1) }
         resizeHandles.onEnd = { [weak self] in self?.endResize() }
+        resizeHandles.onCursorUpdate = { [weak self] in self?.mouseMoved(with: $0) }
+        canvas.onCursorUpdate = { [weak self] in self?.mouseMoved(with: $0) }
         canvas.onInteractionBegan = { [weak self] in self?.commitText() }
         canvas.onTextRequested = { [weak self] point in self?.beginText(at: point) }
         toolbar = NSHostingView(rootView: CaptureToolbar(model: model, supportsScrolling: onStartScrolling != nil,
@@ -73,7 +78,7 @@ final class InlineCaptureView: NSView {
         model.add(Mark(tool: .rectangle, start: .zero, end: CGPoint(x: 100, y: 100), color: .red, width: 4))
         model.add(Mark(tool: .arrow, start: .zero, end: CGPoint(x: 100, y: 100), color: .red, width: 4))
         model.undo(); model.tool = tool; model.showingText = tool == .text
-        model.message = "拖动边线或四角调整选区 · 触碰标注即可拖动 · Enter 复制 · ⌘S 另存为"
+        model.message = "拖动四角调整大小，边线移动选区 · 触碰标注即可拖动 · Enter 复制 · ⌘S 另存为"
         let view = NSHostingView(rootView: CaptureToolbar(model: model, supportsScrolling: true, startScrolling: {}, finish: {},
                                                          save: {}, cancel: {}, reselect: {}, commitText: {}))
         let window = NSWindow(contentRect: CGRect(origin: .zero, size: toolbarSize), styleMask: .borderless, backing: .buffered, defer: false)
@@ -90,6 +95,7 @@ final class InlineCaptureView: NSView {
         resizeHandles.frame = bounds; resizeHandles.selection = selection
         resizeHandles.enabled = !saving && !model.isSamplingColor
         toolbar.frame = CaptureGeometry.toolbarFrame(selection: selection, bounds: bounds.size, size: Self.toolbarSize)
+        refreshCursor()
     }
     func beginResize(_ corner: RectCorner) {
         beginResize(.corner(corner))
@@ -112,7 +118,35 @@ final class InlineCaptureView: NSView {
     @discardableResult private func cancelResize() -> Bool {
         guard let before = resizeSnapshot else { return false }
         model.restore(before); resizeHandles.stopDragging(); resizeSnapshot = nil; resizingHandle = nil
-        needsDisplay = true; needsLayout = true; return true
+        needsDisplay = true; needsLayout = true; layoutSubtreeIfNeeded(); return true
+    }
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let cursorTracking { removeTrackingArea(cursorTracking) }
+        let area = NSTrackingArea(rect: .zero, options: [.activeInKeyWindow, .inVisibleRect, .mouseMoved, .mouseEnteredAndExited, .cursorUpdate], owner: self)
+        addTrackingArea(area); cursorTracking = area
+    }
+    func cursor(at point: CGPoint) -> NSCursor? {
+        guard !saving, !model.isSamplingColor, bounds.contains(point) else { return nil }
+        let handlePoint = resizeHandles.convert(point, from: self)
+        if resizeHandles.dragging { return resizeHandles.cursor(at: handlePoint) }
+        let canvasPoint = canvas.convert(point, from: self)
+        if canvas.isInteracting { return canvas.cursor(at: canvasPoint) }
+        // Route by the same frontmost view that receives a click; text editors and toolbar retain priority.
+        let hit = hitTest(convert(point, to: superview))
+        if hit === resizeHandles { return resizeHandles.cursor(at: handlePoint) }
+        if hit === canvas { return canvas.cursor(at: canvasPoint) }
+        if let textBox, let hit, hit === textBox || hit.isDescendant(of: textBox) { return nil }
+        return .arrow
+    }
+    override func mouseMoved(with event: NSEvent) {
+        cursor(at: convert(event.locationInWindow, from: nil))?.set()
+    }
+    override func mouseEntered(with event: NSEvent) { mouseMoved(with: event) }
+    override func cursorUpdate(with event: NSEvent) { mouseMoved(with: event) }
+    private func refreshCursor() {
+        guard let window, window.isKeyWindow, window.isVisible else { return }
+        cursor(at: convert(window.mouseLocationOutsideOfEventStream, from: nil))?.set()
     }
     override func draw(_ dirtyRect: NSRect) {
         guard let context = NSGraphicsContext.current?.cgContext else { return }
@@ -131,7 +165,7 @@ final class InlineCaptureView: NSView {
         monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self, let window, event.window === window else { return event }
             if model.isSamplingColor || saving { return event }
-            if event.keyCode == 53, cancelResize() || canvas.cancelInteraction() { return nil }
+            if event.keyCode == 53, cancelResize() || canvas.cancelInteraction() { refreshCursor(); return nil }
             if resizeSnapshot != nil || canvas.isInteracting { return nil }
             if event.keyCode == 1 && CaptureShortcut(event: event).modifiers == .command { saveAs(); return nil }
             // Native text editing retains normal typing, Return and ⌘C.
@@ -220,7 +254,7 @@ final class InlineCaptureView: NSView {
     private func endText() {
         textBox?.removeFromSuperview(); textBox = nil; textView = nil
         model.showingText = false; model.textInput = ""; model.textPoint = nil
-        model.message = "拖动边线或四角调整选区 · 触碰标注即可拖动 · Enter 复制 · ⌘S 另存为"
+        model.message = "拖动四角调整大小，边线移动选区 · 触碰标注即可拖动 · Enter 复制 · ⌘S 另存为"
         window?.makeFirstResponder(canvas)
     }
     deinit { if let monitor { NSEvent.removeMonitor(monitor) } }

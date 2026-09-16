@@ -18,6 +18,9 @@ enum CaptureMode { case region, fullscreen }
     private var lastExternalApp: NSRunningApplication?
     private var returnApp: NSRunningApplication?
     private var startedFromApp = false
+    private var recordingSelection: ((RecordingTarget?) -> Void)?
+    private var recordingConfiguration = false
+    private var captureID = UUID()
 
     init() {
         let current = NSWorkspace.shared.frontmostApplication
@@ -39,14 +42,40 @@ enum CaptureMode { case region, fullscreen }
         startedFromApp = front?.processIdentifier == ProcessInfo.processInfo.processIdentifier
         returnApp = startedFromApp ? lastExternalApp : front
         busy = true
+        captureID = UUID()
         // 「截图时隐藏轻截」关闭时不收起窗口，画面中保留轻截自身界面。
-        hiddenWindows = CaptureAppHidingSettings.shared.enabled
+        hiddenWindows = (recordingSelection != nil || CaptureAppHidingSettings.shared.enabled)
             ? NSApp.windows.filter { $0.isVisible && $0.level != .statusBar && !($0 is NSPanel) }
             : []
         hiddenWindows.forEach { $0.orderOut(nil) }
     }
     var onPermissionChange: (() -> Void)?
     var onExport: ((ScreenshotOutput) -> Void)?
+
+    func selectForRecording(service: RecordingService, _ completion: @escaping (RecordingTarget?) -> Void) {
+        guard !busy else { completion(nil); return }
+        guard CGPreflightScreenCaptureAccess() else {
+            CGRequestScreenCaptureAccess()
+            onPermissionChange?()
+            guard CGPreflightScreenCaptureAccess() else { showPermissionHelp(); completion(nil); return }
+            return selectForRecording(service: service, completion)
+        }
+        recordingConfiguration = false
+        recordingUI = service
+        recordingSelection = completion
+        capture(.region)
+    }
+
+    private weak var recordingUI: RecordingService?
+
+    func cancelRecordingSelection() {
+        guard recordingSelection != nil || recordingConfiguration else { return }
+        endCapture(completed: false)
+    }
+    func finishRecordingSelection() {
+        guard recordingConfiguration else { return }
+        endCapture(completed: true)
+    }
 
     func capture(_ mode: CaptureMode) {
         guard !busy else { return }
@@ -57,13 +86,14 @@ enum CaptureMode { case region, fullscreen }
             return capture(mode)
         }
         prepareCapture()
+        let operationID = captureID
         let pointerScreen = NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main
         Task {
             do {
                 try await Task.sleep(nanoseconds: 200_000_000)
                 let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
                 // 隐藏开启时排除本应用，避免残留画面；关闭时不排除，让轻截窗口进入截图。
-                let excluded = CaptureAppHidingSettings.shared.enabled
+                let excluded = (recordingSelection != nil || CaptureAppHidingSettings.shared.enabled)
                     ? content.applications.filter { $0.processID == ProcessInfo.processInfo.processIdentifier }
                     : []
                 let screens = mode == .fullscreen ? [pointerScreen].compactMap { $0 } : NSScreen.screens
@@ -85,16 +115,25 @@ enum CaptureMode { case region, fullscreen }
                                                           localSize: screen.frame.size,
                                                           excludingPID: ProcessInfo.processInfo.processIdentifier)
                     let size = screen.frame.size
-                    windowTargets[id] = mode == .fullscreen ? targets : await Task.detached(priority: .userInitiated) {
+                    windowTargets[id] = mode == .fullscreen || recordingSelection != nil ? targets : await Task.detached(priority: .userInitiated) {
                         InAppPanelDetector.enrich(targets, image: image, localSize: size)
                     }.value
                 }
                 guard !frames.isEmpty else { throw CaptureError.noDisplay }
+                // Selection can be cancelled while ScreenCaptureKit is preparing snapshots.
+                guard busy, operationID == captureID else { return }
+                if recordingSelection != nil {
+                    presentRecordingOverlays(frames, windowTargets: windowTargets)
+                    return
+                }
                 presentOverlays(frames, windowTargets: windowTargets, selectFullScreen: mode == .fullscreen, scrolling: { [weak self] screen, selection, pixels, first in
                         try self?.startScrolling(screen: screen, selection: selection, pixels: pixels, first: first)
                     })
             } catch {
+                guard busy, operationID == captureID else { return }
+                let recorder = recordingUI
                 finish(image: nil)
+                if let recorder { recorder.selectionFailed(error); return }
                 let alert = NSAlert(); alert.messageText = "暂时无法截屏"
                 alert.informativeText = "\(error.localizedDescription)\n请确认系统设置中的「屏幕与系统音频录制」已允许轻截。如刚开启权限，请退出并重新打开轻截。"
                 alert.addButton(withTitle: "好"); alert.runModal()
@@ -102,6 +141,48 @@ enum CaptureMode { case region, fullscreen }
         }
     }
     func showPermissionHelp() { permissionHelp.show() }
+
+    private func presentRecordingOverlays(_ frames: [(NSScreen, CGImage)], windowTargets: [CGDirectDisplayID: [WindowSelectionTarget]]) {
+        closeOverlays()
+        NSApp.activate(ignoringOtherApps: true)
+        for (screen, image) in frames {
+            guard let id = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID else { continue }
+            let window = CaptureOverlayWindow(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false; window.level = .screenSaver
+            window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            window.acceptsMouseMovedEvents = true
+            let view = SelectionView(image: image, size: screen.frame.size, windowTargets: windowTargets[id] ?? [])
+            view.enableRecordingSelection()
+            view.onTargetFinish = { [weak self, weak window] rect, windowID in
+                guard let self, let window, let service = recordingUI, let completion = recordingSelection else { return }
+                guard let rect else { endCapture(completed: false); return }
+                let full = rect == CGRect(origin: .zero, size: screen.frame.size) && windowID == nil
+                let name = windowID.flatMap { selectedID in windowTargets[id]?.first(where: { $0.id == selectedID })?.name }
+                var target = RecordingTarget(displayID: id, displayFrame: screen.frame, scale: screen.backingScaleFactor,
+                                             rect: rect, windowID: windowID,
+                                             title: windowID != nil ? "窗口 · \(name ?? "所选窗口")" : (full ? "整个屏幕" : "自选区域"))
+                if let windowID { target.windowSize = Self.snapshotWindows().first(where: { $0.id == windowID })?.frame.size }
+                recordingSelection = nil
+                recordingConfiguration = true
+                for overlay in overlays {
+                    if let selection = overlay.contentView as? SelectionView {
+                        selection.allowsSelection = false
+                        selection.subviews.forEach { $0.isHidden = true }
+                        selection.instructions = "Esc 取消录屏"
+                        selection.onTargetFinish = { [weak service] _, _ in service?.cancel() }
+                    }
+                }
+                completion(target)
+                let inline = InlineRecordingView(screenshot: image, size: screen.frame.size, target: target, service: service)
+                window.contentView = inline
+                inline.layoutSubtreeIfNeeded()
+                window.makeKey(); window.makeFirstResponder(inline)
+            }
+            window.contentView = view; overlays.append(window)
+            window.makeKeyAndOrderFront(nil); window.makeFirstResponder(view); view.refreshHoverFromPointer()
+        }
+        overlays.first(where: { $0.frame.contains(NSEvent.mouseLocation) })?.makeKey()
+    }
 
     private static func snapshotWindows() -> [CaptureWindow] {
         guard let entries = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
@@ -198,6 +279,9 @@ enum CaptureMode { case region, fullscreen }
         onExport?(.saved(url))
     }
     private func endCapture(completed: Bool) {
+        let cancelledSelection = recordingSelection
+        recordingSelection = nil
+        recordingConfiguration = false; recordingUI = nil
         closeOverlays()
         // A successful capture never opens or restores a workbench/editor window.
         if completed { hiddenWindows.forEach { $0.orderOut(nil) } }
@@ -207,6 +291,7 @@ enum CaptureMode { case region, fullscreen }
         hiddenWindows.removeAll(); scrollSession = nil; busy = false
         if completed || !startedFromApp { returnApp?.activate(options: []) }
         returnApp = nil
+        cancelledSelection?(nil)
     }
     func showInlineDemo() {
         guard !busy, let screen = NSScreen.main,
@@ -314,6 +399,8 @@ final class SelectionView: NSView {
     private var pointerTracking: NSTrackingArea?
     private(set) var selection: CGRect?
     var onFinish: ((CGRect?) -> Void)?
+    var onTargetFinish: ((CGRect?, UInt32?) -> Void)?
+    private var recordingSelectionEnabled = false
     var allowsSelection = true {
         didSet { if !allowsSelection { origin = nil; isDragging = false; updateSelection(nil) } }
     }
@@ -329,6 +416,20 @@ final class SelectionView: NSView {
         setAccessibilityLabel("截图选区"); setAccessibilityValue("等待选择窗口或拖动框选")
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) not supported") }
+    func enableRecordingSelection() {
+        recordingSelectionEnabled = true
+        instructions = "单击录制窗口  ·  拖动选择区域  ·  F 录制全屏  ·  Esc 取消"
+        setAccessibilityLabel("录屏选区")
+        let button = NSButton(title: "录制整个屏幕（F）", target: self, action: #selector(selectEntireScreen))
+        button.bezelStyle = .rounded
+        button.frame = CGRect(x: bounds.midX - 90, y: bounds.height - 124, width: 180, height: 32)
+        addSubview(button)
+    }
+    @objc private func selectEntireScreen() { guard allowsSelection else { return }; onTargetFinish?(bounds, nil) }
+    private func completeSelection(_ rect: CGRect?) {
+        if let onTargetFinish { onTargetFinish(rect, rect == nil ? nil : hoverTarget?.id) }
+        else { onFinish?(rect) }
+    }
     override func resetCursorRects() { addCursorRect(bounds, cursor: .crosshair) }
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -418,11 +519,12 @@ final class SelectionView: NSView {
         let point = convert(event.locationInWindow, from: nil)
         updateDrag(to: point, square: event.modifierFlags.contains(.shift))
         origin = nil; isDragging = false
-        if let selection, selection.width >= 3, selection.height >= 3 { onFinish?(selection) }
+        if let selection, selection.width >= 3, selection.height >= 3 { completeSelection(selection) }
         else { updateHover(at: point) }
     }
     override func keyDown(with event: NSEvent) {
-        if event.keyCode == 53 { onFinish?(nil) }
-        else if allowsSelection, event.keyCode == 36, let selection, selection.width >= 3, selection.height >= 3 { onFinish?(selection) }
+        if event.keyCode == 53 { completeSelection(nil) }
+        else if recordingSelectionEnabled, event.keyCode == 3 { selectEntireScreen() }
+        else if allowsSelection, event.keyCode == 36, let selection, selection.width >= 3, selection.height >= 3 { completeSelection(selection) }
     }
 }

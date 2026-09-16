@@ -1,5 +1,4 @@
 import AppKit
-import CryptoKit
 import Foundation
 import QingJieCore
 import SwiftUI
@@ -13,6 +12,7 @@ struct UpdateError: LocalizedError {
 final class UpdateSettings: ObservableObject {
     enum Stage: Equatable {
         case idle
+        case refreshing
         case downloading(Double)
         case verifying
         case installing
@@ -29,6 +29,7 @@ final class UpdateSettings: ObservableObject {
         var description: String? {
             switch self {
             case .idle, .failed: return nil
+            case .refreshing: return "正在获取最新安装信息…"
             case .downloading(let progress): return "正在下载更新… \(Int((progress * 100).rounded()))%"
             case .verifying: return "正在校验安装包完整性…"
             case .installing: return "正在安装到「应用程序」…"
@@ -126,19 +127,22 @@ final class UpdateSettings: ObservableObject {
 
     /// 匿名读取一次版本信息（无 Cookie、无缓存、不上传任何数据），只做版本号比对。
     func check(notify: Bool = false) async {
-        guard !checking else { return }
+        guard !checking, !stage.busy else { return }
         checking = true
         defer { checking = false }
         do {
-            var request = URLRequest(url: Self.endpoint, cachePolicy: .reloadIgnoringLocalCacheData)
-            request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
-            let (data, _) = try await session.data(for: request)
-            let info = try JSONDecoder().decode(UpdateInfo.self, from: data)
-            latest = info; lastChecked = Date(); failure = nil
+            let info = try await refreshInfo()
+            if case .failed = stage { stage = .idle }
             if notify, updateAvailable == true, !isSkipped(info) { onUpdateFound?(info) }
         } catch {
             failure = "检查更新失败：\(error.localizedDescription)"
         }
+    }
+
+    private func refreshInfo() async throws -> UpdateInfo {
+        let info = try await UpdateTransport.fetchInfo(from: Self.endpoint, using: session)
+        latest = info; lastChecked = Date(); failure = nil
+        return info
     }
 
     func openReleasePage() {
@@ -148,27 +152,32 @@ final class UpdateSettings: ObservableObject {
 
     /// 下载安装包，依次校验 sha256 与固定签名身份，再由独立脚本在退出后整体替换并重启。
     func downloadAndInstall() async {
-        guard !stage.busy else { return }
-        guard let info = latest, updateAvailable == true else { return }
-        guard let package = info.package, let packageURL = URL(string: package.url), packageURL.scheme == "https" else {
-            stage = .failed("该版本没有可用的安装包下载地址，请打开发布页手动更新。")
-            return
-        }
+        guard !stage.busy, !checking, updateAvailable == true else { return }
         guard let requirement = Self.pinnedRequirement else {
             stage = .failed("当前应用没有固定签名信息，无法校验更新包；请使用正式构建手动安装。")
             return
         }
         let work = FileManager.default.temporaryDirectory.appendingPathComponent("qingjie-update-\(UUID().uuidString)", isDirectory: true)
         do {
+            // 用户可能在发现更新数小时后才点击安装；不得复用内存中的旧 URL/校验值。
+            stage = .refreshing
+            let info = try await refreshInfo()
+            guard updateAvailable == true else { stage = .idle; return }
+            guard let package = info.package else {
+                throw UpdateError(message: "该版本没有可用的安装包下载地址，请打开发布页手动更新。")
+            }
             try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
             stage = .downloading(0)
             let archive = work.appendingPathComponent("package.zip")
-            try await Self.download(packageURL, to: archive, expectedBytes: package.bytes) { [weak self] value in
-                Task { @MainActor in self?.stage = .downloading(value) }
+            try await UpdateTransport.download(package, to: archive) { [weak self] value in
+                Task { @MainActor in
+                    guard let self, case .downloading = self.stage else { return }
+                    self.stage = .downloading(value)
+                }
             }
             stage = .verifying
             let extractedApp = try await Task.detached(priority: .userInitiated) {
-                try Self.verifyArchive(archive, sha256: package.sha256)
+                try UpdateTransport.verifyArchive(archive, package: package)
                 return try Self.extract(archive, into: work, requirement: requirement)
             }.value
             stage = .installing
@@ -184,33 +193,6 @@ final class UpdateSettings: ObservableObject {
         } catch {
             try? FileManager.default.removeItem(at: work)
             stage = .failed("更新失败：\(error.localizedDescription)")
-        }
-    }
-
-    nonisolated private static func download(_ url: URL, to destination: URL, expectedBytes: Int?,
-                                 progress: @escaping @Sendable (Double) -> Void) async throws {
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.urlCache = nil
-        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
-        configuration.connectionProxyDictionary = [:]
-        configuration.timeoutIntervalForResource = 600
-        let box = SessionBox()
-        try await withCheckedThrowingContinuation { continuation in
-            let delegate = DownloadDelegate(destination: destination, expectedBytes: expectedBytes, progress: progress) { result in
-                box.session?.invalidateAndCancel()
-                continuation.resume(with: result)
-            }
-            let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
-            box.session = session
-            session.downloadTask(with: url).resume()
-        }
-    }
-
-    nonisolated private static func verifyArchive(_ archive: URL, sha256 expected: String) throws {
-        let digest = SHA256.hash(data: try Data(contentsOf: archive, options: .mappedIfSafe))
-            .map { String(format: "%02x", $0) }.joined()
-        guard digest.caseInsensitiveCompare(expected) == .orderedSame else {
-            throw UpdateError(message: "安装包校验和不符，下载可能已损坏。")
         }
     }
 
@@ -257,6 +239,8 @@ final class UpdateSettings: ObservableObject {
       kill -0 "$pid" 2>/dev/null || break
       sleep 0.2
     done
+    # 超时后仍在运行时停止，不能替换正在使用的应用。
+    if kill -0 "$pid" 2>/dev/null; then exit 1; fi
     sleep 0.5
     if [ -e "$destination" ] && ! mv "$destination" "$backup"; then exit 1; fi
     if mv "$staged" "$destination"; then
@@ -327,48 +311,4 @@ private struct StagingResult {
     let staged: URL
     let backup: URL
     let stagingParent: URL
-}
-
-private final class SessionBox: @unchecked Sendable { var session: URLSession? }
-
-private final class DownloadDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
-    private let destination: URL
-    private let expectedBytes: Int?
-    private let progress: (Double) -> Void
-    private let completion: (Result<Void, Error>) -> Void
-    private var finished = false
-
-    init(destination: URL, expectedBytes: Int?, progress: @escaping @Sendable (Double) -> Void,
-         completion: @escaping (Result<Void, Error>) -> Void) {
-        self.destination = destination
-        self.expectedBytes = expectedBytes
-        self.progress = progress
-        self.completion = completion
-    }
-
-    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
-                    didWriteData bytesWritten: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
-        let total = totalBytesExpectedToWrite > 0 ? totalBytesExpectedToWrite : Int64(expectedBytes ?? 0)
-        guard total > 0 else { return }
-        progress(min(1, Double(totalBytesWritten) / Double(total)))
-    }
-
-    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
-        do {
-            try? FileManager.default.removeItem(at: destination)
-            try FileManager.default.moveItem(at: location, to: destination)
-            finished = true
-        } catch {
-            completion(.failure(error))
-        }
-    }
-
-    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        if let error { completion(.failure(error)); return }
-        if finished {
-            completion(.success(()))
-        } else if let response = task.response as? HTTPURLResponse, response.statusCode != 200 {
-            completion(.failure(UpdateError(message: "下载失败，服务器返回 \(response.statusCode)。")))
-        }
-    }
 }

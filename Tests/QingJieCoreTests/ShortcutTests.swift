@@ -71,10 +71,10 @@ final class ShortcutTests: XCTestCase {
         let backend = Backend()
         let active = backend.registry(); active.start()
         let oldIDs = Array(backend.installed.keys)
-        XCTAssertEqual(oldIDs.count, 2)
+        XCTAssertEqual(oldIDs.count, 3)
         active.suspend(); XCTAssertTrue(backend.installed.isEmpty)
         XCTAssertTrue(oldIDs.allSatisfy { active.action(for: $0) == nil })
-        active.resume(); XCTAssertEqual(backend.installed.count, 2)
+        active.resume(); XCTAssertEqual(backend.installed.count, 3)
         XCTAssertTrue(oldIDs.allSatisfy { active.action(for: $0) == nil })
         XCTAssertEqual(Set(backend.installed.keys.compactMap { active.action(for: $0) }), Set(CaptureShortcutAction.allCases))
     }
@@ -85,7 +85,7 @@ final class ShortcutTests: XCTestCase {
         try registry.apply(swapped)
         XCTAssertEqual(registry.configuration, swapped)
         for (id, shortcut) in backend.installed { XCTAssertEqual(swapped[registry.action(for: id)!], shortcut) }
-        registry.start(); XCTAssertEqual(backend.installed.count, 2)
+        registry.start(); XCTAssertEqual(backend.installed.count, 3)
     }
     func testConflictRollsBackAndLeavesOriginalSettingsActive() {
         let backend = Backend(), config = ShortcutConfiguration.defaults
@@ -115,9 +115,9 @@ final class ShortcutTests: XCTestCase {
         let backend = Backend()
         let active = backend.registry(); active.start()
         var config = ShortcutConfiguration.defaults; config.fullscreen = nil
-        try active.apply(config); XCTAssertEqual(backend.installed.count, 1)
+        try active.apply(config); XCTAssertEqual(backend.installed.count, 2)
         XCTAssertNil(active.configuration.fullscreen)
-        try active.apply(.defaults); XCTAssertEqual(backend.installed.count, 2)
+        try active.apply(.defaults); XCTAssertEqual(backend.installed.count, 3)
     }
     func testChangesCannotCommitWhileRecorderIsActive() {
         let registry = Backend().registry()
@@ -129,13 +129,13 @@ final class ShortcutTests: XCTestCase {
         let backend = Backend()
         backend.occupied = Set(CaptureShortcutAction.allCases.compactMap { ShortcutConfiguration.defaults[$0] })
         let registry = backend.registry(); registry.start()
-        XCTAssertEqual(registry.failures.count, 2)
+        XCTAssertEqual(registry.failures.count, 3)
         var repaired = ShortcutConfiguration.defaults; repaired.region = custom
         try registry.apply(repaired)
         XCTAssertEqual(registry.configuration, repaired)
-        XCTAssertEqual(registry.failures.count, 1)
+        XCTAssertEqual(registry.failures.count, 2)
         XCTAssertEqual(backend.installed.values.first, custom)
-        repaired.fullscreen = nil; try registry.apply(repaired)
+        repaired.fullscreen = nil; repaired.recording = nil; try registry.apply(repaired)
         XCTAssertEqual(registry.failures.count, 0)
         XCTAssertNil(registry.configuration.fullscreen)
     }
@@ -167,7 +167,30 @@ final class ShortcutTests: XCTestCase {
         XCTAssertNil(registry.action(for: retired))
         XCTAssertTrue(registry.failures.isEmpty)
         XCTAssertEqual(Set(backend.installed.values), [custom])
-        XCTAssertEqual(CaptureShortcutAction.allCases, [.region, .fullscreen])
+        XCTAssertEqual(CaptureShortcutAction.allCases, [.region, .fullscreen, .recording])
+    }
+    func testRecordingMigrationPreservesCustomBindingsAndAvoidsConflicts() throws {
+        let legacy = ShortcutConfiguration(region: custom, fullscreen: nil)
+        var old = try JSONSerialization.jsonObject(with: JSONEncoder().encode(legacy)) as! [String: Any]
+        old.removeValue(forKey: "recording")
+        var decoded = try JSONDecoder().decode(ShortcutConfiguration.self, from: JSONSerialization.data(withJSONObject: old))
+        XCTAssertEqual(decoded.region, custom)
+        XCTAssertNil(decoded.fullscreen)
+        XCTAssertEqual(decoded.recording, ShortcutConfiguration.defaults.recording)
+        old["region"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(ShortcutConfiguration.defaults.recording!))
+        decoded = try JSONDecoder().decode(ShortcutConfiguration.self, from: JSONSerialization.data(withJSONObject: old))
+        XCTAssertEqual(decoded.region, ShortcutConfiguration.defaults.recording)
+        XCTAssertNil(decoded.recording)
+        XCTAssertNil(decoded.validationMessage)
+    }
+    func testDisabledRecordingRemainsDisabledAfterRelaunch() throws {
+        var value = ShortcutConfiguration.defaults
+        value.recording = nil
+        let decoded = try JSONDecoder().decode(ShortcutConfiguration.self, from: JSONEncoder().encode(value))
+        XCTAssertNil(decoded.recording)
+        XCTAssertEqual(decoded, value)
+        var duplicate = ShortcutConfiguration.defaults; duplicate.recording = duplicate.region
+        XCTAssertNotNil(duplicate.validationMessage)
     }
     func testInvalidRetiredBindingCannotInvalidateValidCurrentSettings() throws {
         let suite = "QingJie.tests.\(UUID().uuidString)"

@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -180,6 +181,27 @@ def running_executables():
     return run(["/bin/ps", "-axo", "comm="]).splitlines()
 
 
+def installed_is_running(value):
+    return any(path.endswith("/Contents/MacOS/" + value["executable"]) for path in running_executables())
+
+
+def quit_installed(value, timeout=15.0):
+    """让正在运行的轻截优雅退出；返回之前是否在运行。"""
+    if not installed_is_running(value):
+        return False
+    try:
+        run(["/usr/bin/osascript", "-e", f'tell application id "{value["bundleIdentifier"]}" to quit'])
+    except RuntimeError:
+        raise RuntimeError("无法向轻截发送退出事件（终端可能未获自动化授权）；"
+                           "请手动退出轻截后运行 ./scripts/install.sh，或在弹窗中允许控制。")
+    deadline = time.monotonic() + timeout
+    while installed_is_running(value) and time.monotonic() < deadline:
+        time.sleep(0.2)
+    if installed_is_running(value):
+        raise RuntimeError("轻截未能自动退出，已停止替换安装；请手动退出后重试。")
+    return True
+
+
 def publish_directory(staged, destination):
     """Replace the whole verified bundle; roll back if the second rename fails."""
     backup = staged.parent / "previous.app"
@@ -193,7 +215,7 @@ def publish_directory(staged, destination):
         raise
 
 
-def build():
+def build(install_after=True):
     value = config()
     check_signer(value)
     destination = ROOT / "dist" / (value["appName"] + ".app")
@@ -218,7 +240,15 @@ def build():
         run(["/usr/bin/iconutil", "-c", "icns", temporary / "AppIcon.iconset", "-o", staged / "Contents/Resources/AppIcon.icns"])
         sign(staged)
         publish_directory(staged, destination)
-    print(f"已构建：{destination}\n安装更新：./scripts/install.sh")
+    if not install_after:
+        print(f"已构建：{destination}\n安装更新：./scripts/install.sh")
+        return
+    # 每次构建都替换当前安装：先优雅退出运行中的轻截，再走 install 的完整校验替换，最后重启。
+    was_running = quit_installed(value)
+    install()
+    if was_running:
+        run(["/usr/bin/open", value["installPath"]])
+    print(f"已构建并替换当前安装：{value['installPath']}")
 
 
 def install():
@@ -226,7 +256,7 @@ def install():
     source = ROOT / "dist" / (value["appName"] + ".app")
     destination = Path(value["installPath"])
     verify(source, value)
-    if any(path.endswith("/Contents/MacOS/" + value["executable"]) for path in running_executables()):
+    if installed_is_running(value):
         raise RuntimeError("请先退出轻截，再安装更新，以免运行中的版本与磁盘版本不一致。")
     if destination.is_symlink():
         raise RuntimeError("固定安装位置是符号链接，请先检查，安装已停止。")
@@ -280,15 +310,61 @@ def release_assets(args, value):
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", tag):
         raise RuntimeError("无效的发布标签。")
     title = info["CFBundleShortVersionString"]
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    prefix = value.get("archiveName") or (value["appName"] + "-macOS-arm64")
+    # 不再覆盖固定文件名；旧客户端手中的 URL 必须始终对应原来的字节。
+    asset_name = f'{prefix}-{title}-build{info["CFBundleVersion"]}-{digest[:12]}.zip'
+    release = github_release(gh, args.github_repo, tag)
+    if release is not None:
+        assets = release.get("assets", [])
+        existing = next((asset for asset in assets if asset["name"] == asset_name), None)
+        if existing is not None:
+            verify_release_asset(existing, archive, digest)
+            return existing["browser_download_url"], release["html_url"]
+        if any(asset["name"].startswith(prefix) and asset["name"].endswith(".zip") for asset in assets):
+            raise RuntimeError("该 Release 已有不同的安装包，禁止覆盖。请递增版本/build 并使用新的 Release 标签。")
+    with tempfile.TemporaryDirectory(prefix="qingjie-release-") as directory:
+        upload = Path(directory) / asset_name
+        shutil.copyfile(archive, upload)
+        if release is None:
+            run([gh, "release", "create", tag, str(upload), "--repo", args.github_repo,
+                 "--title", title, "--notes", args.notes or title])
+        else:
+            run([gh, "release", "upload", tag, str(upload), "--repo", args.github_repo])
+    release = github_release(gh, args.github_repo, tag)
+    asset = next((asset for asset in (release or {}).get("assets", []) if asset["name"] == asset_name), None)
+    if asset is None:
+        raise RuntimeError("上传后未找到安装包，停止生成更新源。")
+    verify_release_asset(asset, archive, digest)
+    print(f"压缩包已上传并核对 GitHub SHA-256：{args.github_repo} {tag}")
+    return asset["browser_download_url"], release["html_url"]
+
+
+def github_release(gh, repository, tag):
     try:
-        run([gh, "release", "create", tag, str(archive), "--repo", args.github_repo,
-             "--title", title, "--notes", args.notes or title])
-    except RuntimeError:
-        # 标签已存在时只替换资产，不改动已有发布说明。
-        run([gh, "release", "upload", tag, str(archive), "--repo", args.github_repo, "--clobber"])
-    print(f"压缩包已上传到 GitHub Release：{args.github_repo} {tag}")
-    return (f"https://github.com/{args.github_repo}/releases/download/{tag}/{archive.name}",
-            f"https://github.com/{args.github_repo}/releases/tag/{tag}")
+        return json.loads(run([gh, "api", f"repos/{repository}/releases/tags/{tag}"]))
+    except RuntimeError as error:
+        if "HTTP 404" in str(error):
+            return None
+        raise
+
+
+def verify_release_asset(asset, archive, digest):
+    if (asset.get("state") != "uploaded" or asset.get("size") != archive.stat().st_size
+            or asset.get("digest") != "sha256:" + digest):
+        raise RuntimeError("GitHub 安装包的大小/SHA-256 与本地包不一致，停止生成更新源。")
+
+
+def verify_package(archive, app, value):
+    """构建后忘记重新打包时，不能把新版本信息与旧压缩包拼成更新源。"""
+    with tempfile.TemporaryDirectory(prefix="qingjie-package-verify-") as directory:
+        extracted = Path(directory)
+        run(["/usr/bin/ditto", "-x", "-k", archive, extracted])
+        packaged_app = extracted / app.name
+        verify(packaged_app, value)
+        for suffix in ("Contents/Info.plist", "Contents/MacOS/" + value["executable"]):
+            if (packaged_app / suffix).read_bytes() != (app / suffix).read_bytes():
+                raise RuntimeError("压缩包与当前构建不一致，请重新运行 package 后再发布。")
 
 
 def feed(args):
@@ -298,6 +374,7 @@ def feed(args):
     archive = archive_path(value)
     if not archive.is_file():
         raise RuntimeError("缺少发布压缩包；请先运行 python3 scripts/app_identity.py package。")
+    verify_package(archive, app, value)
     if args.github_repo:
         args.package_url, args.release_url = release_assets(args, value)
     if not args.package_url or not args.package_url.startswith("https://"):
@@ -350,11 +427,12 @@ def main():
     parser.add_argument("--notes", help="更新说明，可选（feed/publish）")
     parser.add_argument("--github-repo", help="用 gh CLI 上传压缩包到该仓库的 Release，形如 owner/name（feed/publish）")
     parser.add_argument("--tag", help="Release 标签，默认 v<版本号>（配合 --github-repo）")
+    parser.add_argument("--no-install", action="store_true", help="仅构建 dist 成品，不替换 /Applications 安装")
     args = parser.parse_args()
     if args.command in ("sign", "verify") and args.app is None:
         parser.error("需要应用路径")
     if args.command == "init-local": init_local()
-    elif args.command == "build": build()
+    elif args.command == "build": build(install_after=not args.no_install)
     elif args.command == "sign": sign(args.app.resolve())
     elif args.command == "verify": print(verify(args.app.resolve()))
     elif args.command == "install": install()

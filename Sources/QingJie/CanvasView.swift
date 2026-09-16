@@ -46,8 +46,12 @@ final class CanvasScrollView: NSScrollView {
 final class AnnotationCanvas: NSView {
     let model: EditorModel
     var drawsBackdrop = true
+    /// 工作台里绘图工具用十字线；屏幕内标注（截屏后）整体用普通箭头。
+    var crosshairForTools = true
     var onTextRequested: ((CGPoint) -> Void)?
     var onInteractionBegan: (() -> Void)?
+    /// Inline capture owns hover cursors for both the canvas and the overlapping capture border.
+    var onCursorUpdate: ((NSEvent) -> Void)?
     var draft: Mark?
     var dragOrigin: CGPoint?
     var moveSnapshot: EditorSnapshot?
@@ -65,7 +69,10 @@ final class AnnotationCanvas: NSView {
 
     init(model: EditorModel) { self.model = model; super.init(frame: .zero) }
     required init?(coder: NSCoder) { fatalError("init(coder:) not supported") }
-    override func resetCursorRects() { addCursorRect(bounds, cursor: model.tool == .select ? .arrow : .crosshair) }
+    private var baseCursor: NSCursor { model.tool == .select || !crosshairForTools ? .arrow : .crosshair }
+    override func resetCursorRects() {
+        if onCursorUpdate == nil { addCursorRect(bounds, cursor: baseCursor) }
+    }
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         if let tracking { removeTrackingArea(tracking) }
@@ -78,13 +85,17 @@ final class AnnotationCanvas: NSView {
               [.rectangle, .ellipse, .mosaic].contains(selected.tool) else { return nil }
         return InteractionGeometry.corner(at: point, rect: selected.rect, radius: 7 / displayScale)
     }
-    override func mouseMoved(with event: NSEvent) {
-        guard !isInteracting else { return }
-        let local = convert(event.locationInWindow, from: nil)
+    func cursor(at local: CGPoint) -> NSCursor {
+        if originalMark != nil { return resizeCorner?.cursor ?? .closedHand }
+        if draft != nil { return .crosshair }
         let point = CaptureGeometry.imagePoint(local, displayedIn: imageFrame, imageSize: model.imageSize)
-        if imageFrame.contains(local), let corner = handle(at: point) { corner.cursor.set() }
-        else if imageFrame.contains(local), mark(at: point) != nil { NSCursor.openHand.set() }
-        else { (model.tool == .select ? NSCursor.arrow : .crosshair).set() }
+        if imageFrame.contains(local), let corner = handle(at: point) { return corner.cursor }
+        if imageFrame.contains(local), mark(at: point) != nil { return .openHand }
+        return baseCursor
+    }
+    override func mouseMoved(with event: NSEvent) {
+        if let onCursorUpdate { onCursorUpdate(event); return }
+        cursor(at: convert(event.locationInWindow, from: nil)).set()
     }
     override func cursorUpdate(with event: NSEvent) { mouseMoved(with: event) }
     override func draw(_ dirtyRect: NSRect) {
@@ -151,6 +162,7 @@ final class AnnotationCanvas: NSView {
         } else {
             model.selectedID = nil
             draft = Mark(tool: model.tool, start: point, end: point, points: [point], color: model.color, width: model.lineWidth, fontSize: model.fontSize, mosaicStyle: model.mosaicStyle)
+            NSCursor.crosshair.set()
         }
         needsDisplay = true
     }

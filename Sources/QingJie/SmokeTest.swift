@@ -9,6 +9,7 @@ enum SmokeTest {
         print("PASS: \(label)")
     }
     @MainActor static func run() throws {
+        try RecordingChecks.run()
         try checkShortcutRecorder()
         try checkInlineCaptureAndPermissionDrag()
         try checkSelectionToScrolling()
@@ -17,6 +18,7 @@ enum SmokeTest {
         try checkBrowserContentSelection()
         try checkCaptureResizing()
         try checkCaptureEdgeDragging()
+        try checkCaptureHoverCursors()
         try checkDirectAnnotationEditing()
         try checkScreenshotSaving()
         try checkScreenshotAppearance()
@@ -509,10 +511,10 @@ enum SmokeTest {
                               windowNumber: host.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 0)!
         }
         let gestures: [(CGPoint, CGPoint, CGRect)] = [
-            (CGPoint(x: 220, y: 84), CGPoint(x: 290, y: 44), CGRect(x: 100, y: 40, width: 300, height: 240)),
-            (CGPoint(x: 104, y: 170), CGPoint(x: 64, y: 190), CGRect(x: 60, y: 80, width: 340, height: 200)),
-            (CGPoint(x: 396, y: 170), CGPoint(x: 436, y: 140), CGRect(x: 100, y: 80, width: 340, height: 200)),
-            (CGPoint(x: 320, y: 276), CGPoint(x: 370, y: 316), CGRect(x: 100, y: 80, width: 300, height: 240))
+            (CGPoint(x: 220, y: 84), CGPoint(x: 290, y: 44), CGRect(x: 170, y: 40, width: 300, height: 200)),
+            (CGPoint(x: 104, y: 170), CGPoint(x: 64, y: 190), CGRect(x: 60, y: 100, width: 300, height: 200)),
+            (CGPoint(x: 396, y: 170), CGPoint(x: 436, y: 140), CGRect(x: 140, y: 50, width: 300, height: 200)),
+            (CGPoint(x: 320, y: 276), CGPoint(x: 370, y: 316), CGRect(x: 150, y: 120, width: 300, height: 200))
         ]
         try require(gestures.allSatisfy { handles.hitTest(inline.convert($0.0, to: handles.superview)) === handles }
                     && handles.hitTest(CGPoint(x: 250, y: 150)) == nil,
@@ -531,17 +533,87 @@ enum SmokeTest {
             handles.mouseDragged(with: event(.leftMouseDragged, end)); handles.mouseUp(with: event(.leftMouseUp, end))
             try require(inline.selection == expected && inline.model.image.width == Int(expected.width * 2)
                         && inline.model.image.height == Int(expected.height * 2) && inline.model.undoStack.count == undoCount + 1,
-                        "边线拖动 \(start) → \(end) 保持单轴与 Retina 像素，一次拖动只记一次撤销")
+                        "边线拖动 \(start) → \(end) 整体移动选区且大小不变，一次拖动只记一次撤销")
             let mark = inline.model.marks[0]
             try require(expected.minX + mark.start.x / 2 == 140 && expected.minY + mark.start.y / 2 == 110,
-                        "边线调整后已有文字保持原屏幕位置")
+                        "边线移动后已有文字保持原屏幕位置")
             inline.model.undo()
             try require(inline.selection == rect && inline.model.image === snapshot.image && inline.model.marks[0].start == snapshot.marks[0].start,
-                        "撤销边线调整同时恢复选区、原图及标注坐标")
+                        "撤销边线移动同时恢复选区、原图及标注坐标")
             inline.model.redo()
-            try require(inline.selection == expected, "重做边线拖动恢复调整后的范围")
+            try require(inline.selection == expected, "重做边线拖动恢复移动后的范围")
             inline.model.undo(); inline.layout()
         }
+    }
+
+    @MainActor private static func checkCaptureHoverCursors() throws {
+        let image = DemoImage.make(), size = CGSize(width: image.width / 2, height: image.height / 2)
+        let rect = CGRect(x: 100, y: 80, width: 300, height: 200)
+        let inline = InlineCaptureView(screenshot: image, crop: image.cropping(to: CGRect(x: 200, y: 160, width: 600, height: 400))!,
+                                       selection: rect, size: size)
+        let host = NSWindow(contentRect: CGRect(origin: .zero, size: size), styleMask: .borderless, backing: .buffered, defer: true)
+        host.isReleasedWhenClosed = false; host.contentView = inline
+        defer { host.contentView = nil; host.close(); NSCursor.arrow.set() }
+        inline.layout(); inline.updateTrackingAreas(); inline.canvas.updateTrackingAreas()
+        func event(_ point: CGPoint, type: NSEvent.EventType = .mouseMoved) -> NSEvent {
+            NSEvent.mouseEvent(with: type, location: inline.convert(point, to: nil), modifierFlags: [], timestamp: 0,
+                              windowNumber: host.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 0)!
+        }
+        var samples: [(CGPoint, NSCursor)] = []
+        for offset: CGFloat in [-6, -1, 0, 1, 6] {
+            samples += [(CGPoint(x: rect.midX, y: rect.minY + offset), .openHand),
+                        (CGPoint(x: rect.midX, y: rect.maxY + offset), .openHand),
+                        (CGPoint(x: rect.minX + offset, y: rect.midY), .openHand),
+                        (CGPoint(x: rect.maxX + offset, y: rect.midY), .openHand)]
+        }
+        for corner in RectCorner.allCases {
+            let center = corner.point(in: rect)
+            for offset: CGFloat in [-8, 0, 8] {
+                samples.append((CGPoint(x: center.x + offset, y: center.y + offset), corner.cursor))
+            }
+        }
+        samples += [(CGPoint(x: 109, y: 84), RectCorner.topLeft.cursor), (CGPoint(x: 109.1, y: 84), .openHand),
+                    (CGPoint(x: 220, y: 90), .arrow), (CGPoint(x: 250, y: 180), .arrow), (CGPoint(x: 70, y: 60), .arrow)]
+        for (point, expected) in samples {
+            let move = event(point)
+            // AppKit may deliver overlapping parent/canvas tracking callbacks in either order.
+            inline.mouseMoved(with: move); inline.canvas.mouseMoved(with: move)
+            try require(NSCursor.current == expected, "边角悬停 \(point) 不会被画布光标覆盖")
+            inline.canvas.cursorUpdate(with: move); inline.cursorUpdate(with: move)
+            try require(NSCursor.current == expected, "反向光标更新 \(point) 与点击热区一致")
+            if expected != .arrow {
+                try require(inline.hitTest(inline.convert(point, to: inline.superview)) === inline.resizeHandles,
+                            "边角光标 \(point) 对应真实可拖动范围")
+            }
+        }
+        try require(inline.trackingAreas.contains { $0.options.contains(.cursorUpdate) && $0.options.contains(.mouseMoved) },
+                    "选区外侧和角落也持续跟踪光标")
+        let handles = inline.resizeHandles, start = CGPoint(x: 220, y: 84), end = CGPoint(x: 250, y: 114)
+        handles.mouseDown(with: event(start, type: .leftMouseDown))
+        inline.canvas.mouseMoved(with: event(CGPoint(x: 250, y: 200)))
+        try require(NSCursor.current == .closedHand, "拖动边线期间经过画布保持闭合抓手")
+        handles.mouseDragged(with: event(end, type: .leftMouseDragged))
+        handles.mouseUp(with: event(end, type: .leftMouseUp))
+        try require(NSCursor.current == .openHand, "边线拖动松手立即恢复张开抓手")
+        try require(inline.cursor(at: start) == .arrow && inline.cursor(at: end) == .openHand,
+                    "移动后旧边线恢复箭头，新边线立即可抓取")
+        inline.model.undo(); inline.layout()
+        try require(inline.cursor(at: start) == .openHand && inline.cursor(at: end) == .arrow,
+                    "撤销移动后悬停热区跟随选区恢复")
+        let cornerPoint = CGPoint(x: 106, y: 86)
+        handles.mouseDown(with: event(cornerPoint, type: .leftMouseDown))
+        inline.canvas.mouseMoved(with: event(CGPoint(x: 250, y: 200)))
+        try require(NSCursor.current == RectCorner.topLeft.cursor, "拖角期间经过画布保持缩放光标")
+        handles.mouseUp(with: event(cornerPoint, type: .leftMouseUp))
+        try require(inline.selection == rect && NSCursor.current == RectCorner.topLeft.cursor,
+                    "点角不跳动，松手保持正确角落光标")
+        let mark = Mark(tool: .rectangle, start: CGPoint(x: 150, y: 100), end: CGPoint(x: 350, y: 260), color: .red, width: 4)
+        inline.model.add(mark); inline.model.selectedID = mark.id; inline.layout()
+        try require(inline.cursor(at: CGPoint(x: 175, y: 130)) == RectCorner.topLeft.cursor
+                    && inline.cursor(at: CGPoint(x: 220, y: 130)) == .openHand,
+                    "选区内部仍能识别标注的缩放角与移动边线")
+        inline.model.sampleColor(using: { _ in }); inline.layout()
+        try require(inline.cursor(at: start) == nil && handles.hitTest(start) == nil, "取色期间不接管光标或拖动边线")
     }
 
     @MainActor private static func checkDirectAnnotationEditing() throws {

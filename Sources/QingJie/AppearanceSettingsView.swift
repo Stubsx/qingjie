@@ -49,6 +49,8 @@ struct AppSettingsView: View {
             Divider()
             ShortcutSettingsView(hotKeys: hotKeys)
             Divider()
+            RecordingSettingsView()
+            Divider()
             GeneralSettingsView()
         }
     }

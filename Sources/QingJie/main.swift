@@ -7,6 +7,8 @@ import QingJieCore
     let state = AppState()
     let captureService = CaptureService()
     let hotKeys = HotKeys()
+    let recordingService = RecordingService()
+    private var waitingToQuit = false
     var statusItem: NSStatusItem!
     var homeWindow: NSWindow!
     var editors: [NSWindow] = []
@@ -34,15 +36,42 @@ import QingJieCore
         }
         NSApp.setActivationPolicy(DockIconSettings.shared.showsIcon ? .regular : .accessory)
         createMenus()
-        state.capture = { [weak self] in self?.captureService.capture($0) }
+        state.capture = { [weak self] in self?.capture($0) }
+        state.recordScreen = { [weak self] in self?.recordScreen() }
         state.importImage = { [weak self] in self?.importImage() }
         state.openHistory = { [weak self] in self?.openImage($0) }
-        state.showDemo = { [weak self] in self?.captureService.showInlineDemo() }
-        state.showScrollDemo = { [weak self] in self?.captureService.showScrollDemo() }
+        state.showDemo = { [weak self] in self?.demo() }
+        state.showScrollDemo = { [weak self] in
+            guard let self, !recordingService.busy else { return }; captureService.showScrollDemo()
+        }
         state.requestPermission = { [weak self] in self?.captureService.showPermissionHelp() }
         captureService.onPermissionChange = { [weak self] in self?.state.hasPermission = CGPreflightScreenCaptureAccess() }
         captureService.onExport = { [weak self] in self?.state.remember($0) }
-        hotKeys.onTrigger = { [weak self] in self?.captureService.capture($0 == .region ? .region : .fullscreen) }
+        recordingService.selectTarget = { [weak self] completion in
+            guard let self else { return }
+            captureService.selectForRecording(service: recordingService, completion)
+        }
+        recordingService.cancelSelection = { [weak self] in self?.captureService.cancelRecordingSelection() }
+        recordingService.finishSelection = { [weak self] in self?.captureService.finishRecordingSelection() }
+        recordingService.shortcutLabel = { [weak self] in self?.hotKeys.configuration[.recording]?.display ?? "菜单栏「停止录屏」" }
+        recordingService.onChange = { [weak self] in
+            guard let self else { return }
+            state.recordingTitle = recordingService.statusTitle
+            state.recordingBusy = recordingService.busy
+            statusItem.button?.image = NSImage(systemSymbolName: recordingService.isWriting ? "record.circle" : "viewfinder", accessibilityDescription: "轻截")
+            refreshShortcutPresentation()
+        }
+        recordingService.onSettled = { [weak self] in
+            guard let self, waitingToQuit else { return }
+            waitingToQuit = false; NSApp.reply(toApplicationShouldTerminate: true)
+        }
+        hotKeys.onTrigger = { [weak self] action in
+            switch action {
+            case .region: self?.capture(.region)
+            case .fullscreen: self?.capture(.fullscreen)
+            case .recording: self?.recordScreen()
+            }
+        }
         hotKeys.onChange = { [weak self] in self?.refreshShortcutPresentation() }
         hotKeys.register()
         UpdateSettings.shared.startAutomaticChecks()
@@ -54,9 +83,16 @@ import QingJieCore
     }
     func applicationDidBecomeActive(_ notification: Notification) { state.hasPermission = CGPreflightScreenCaptureAccess() }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard recordingService.busy else { return .terminateNow }
+        if recordingService.isWriting {
+            waitingToQuit = true; recordingService.prepareToQuit(); return .terminateLater
+        }
+        recordingService.cancel(); return .terminateNow
+    }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         Logger(subsystem: "com.local.qingjie", category: "Capture").notice("Application reopen requested. hasVisibleWindows=\(flag)")
-        guard !captureService.busy else { return false }
+        guard !captureService.busy, !recordingService.busy else { return false }
         showHome(); return true
     }
     private func makeWindow<V: View>(title: String, size: NSSize, content: V) -> NSWindow {
@@ -73,12 +109,21 @@ import QingJieCore
     private func refreshShortcutPresentation() {
         state.shortcutConfiguration = hotKeys.configuration; state.hotKeyFailed = hotKeys.failed
         for (item, action, title) in captureMenuItems {
-            item.title = title + (hotKeys.configuration[action].map { "  " + $0.display } ?? "")
+            let currentTitle = action == .recording ? recordingService.statusTitle : title
+            item.title = currentTitle + (hotKeys.configuration[action].map { "  " + $0.display } ?? "")
         }
     }
-    @objc func region() { captureService.capture(.region) }
-    @objc func fullscreen() { captureService.capture(.fullscreen) }
-    @objc func demo() { captureService.showInlineDemo() }
+    private func capture(_ mode: CaptureMode) {
+        guard !recordingService.busy else { NSSound.beep(); return }
+        captureService.capture(mode)
+    }
+    @objc func region() { capture(.region) }
+    @objc func fullscreen() { capture(.fullscreen) }
+    @objc func recordScreen() {
+        guard !captureService.busy || [.selecting, .configuring].contains(recordingService.phase) else { return }
+        recordingService.toggle()
+    }
+    @objc func demo() { guard !recordingService.busy else { return }; captureService.showInlineDemo() }
     @objc func importImage() {
         let panel = NSOpenPanel(); panel.allowedContentTypes = [.image]; panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false; panel.title = "打开图片进行标注"
@@ -125,6 +170,7 @@ import QingJieCore
         add("打开图片…", action: #selector(importImage), key: "o", to: fileMenu)
         addCapture("区域截图", selector: #selector(region), action: .region, to: fileMenu)
         addCapture("全屏截图", selector: #selector(fullscreen), action: .fullscreen, to: fileMenu)
+        addCapture("开始录屏", selector: #selector(recordScreen), action: .recording, to: fileMenu)
         fileMenu.addItem(.separator()); add("显示工作台", action: #selector(showHome), to: fileMenu)
         let fileItem = NSMenuItem(title: "文件", action: nil, keyEquivalent: ""); fileItem.submenu = fileMenu; main.addItem(fileItem)
         let editMenu = NSMenu(title: "编辑")
@@ -138,6 +184,7 @@ import QingJieCore
         let menu = NSMenu()
         addCapture("区域截图", selector: #selector(region), action: .region, to: menu)
         addCapture("全屏截图", selector: #selector(fullscreen), action: .fullscreen, to: menu)
+        addCapture("开始录屏", selector: #selector(recordScreen), action: .recording, to: menu)
         menu.addItem(.separator()); add("打开图片…", action: #selector(importImage), to: menu)
         add("显示工作台", action: #selector(showHome), to: menu); add("体验标注", action: #selector(demo), to: menu)
         add("设置…", action: #selector(showSettings), to: menu)

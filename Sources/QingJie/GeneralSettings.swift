@@ -134,7 +134,7 @@ struct GeneralSettingsView: View {
                 HStack(alignment: .center, spacing: 14) {
                     VStack(alignment: .leading, spacing: 5) {
                         Text("自动检查更新").font(.system(size: 14, weight: .medium))
-                        Text("每天匿名读取一次版本信息，只比对版本号，不上传数据；发现新版本可在此一键下载安装，替换前会校验文件完整性和固定签名身份，完成后自动重启。")
+                        Text("每天检查一次新版本，发现后可在此一键下载安装。")
                             .font(.system(size: 11)).foregroundStyle(Theme.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                         updateStatus
@@ -161,7 +161,7 @@ struct GeneralSettingsView: View {
                                 if latest.package != nil {
                                     Button("下载并安装") { Task { await update.downloadAndInstall() } }
                                         .buttonStyle(ActionButtonStyle(primary: true))
-                                        .disabled(update.stage.busy)
+                                        .disabled(update.stage.busy || update.checking)
                                         .accessibilityLabel("下载并安装新版本")
                                 }
                                 Button("查看更新") { update.openReleasePage() }

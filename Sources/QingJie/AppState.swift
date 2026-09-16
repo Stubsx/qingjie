@@ -32,9 +32,12 @@ final class AppState: ObservableObject {
     @Published var page = HomePage.workbench
     @Published var notice = ""
     @Published var hotKeyFailed = false
+    @Published var recordingTitle = "开始录屏"
+    @Published var recordingBusy = false
     @Published var shortcutConfiguration = ShortcutConfiguration.defaults
     func shortcutLabel(_ action: CaptureShortcutAction) -> String { shortcutConfiguration[action]?.display ?? "未设置" }
     var capture: ((CaptureMode) -> Void)?
+    var recordScreen: (() -> Void)?
     var importImage: (() -> Void)?
     var openHistory: ((URL) -> Void)?
     var showDemo: (() -> Void)?

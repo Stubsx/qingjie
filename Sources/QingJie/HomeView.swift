@@ -87,7 +87,7 @@ struct HomeView: View {
                 Text("轻轻一截，\n重点即刻呈现。").font(.system(size: 34, weight: .semibold)).lineSpacing(4)
                 Text("从屏幕到表达，让每一次沟通更清晰。").font(.system(size: 12)).foregroundStyle(Theme.secondary)
                 Button { state.capture?(.region) } label: { Label("开始区域截图", systemImage: "viewfinder") }
-                    .buttonStyle(ActionButtonStyle(primary: true)).padding(.top, 4)
+                    .buttonStyle(ActionButtonStyle(primary: true)).padding(.top, 4).disabled(state.recordingBusy)
             }
             Spacer(minLength: 0)
             ZStack {
@@ -106,9 +106,12 @@ struct HomeView: View {
             .background(Color(red: 0.91, green: 0.94, blue: 0.89), in: RoundedRectangle(cornerRadius: 18))
     }
     private var captureActions: some View {
-        LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 3), spacing: 12) {
+        LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 2), spacing: 12) {
             actionCard("区域截图", subtitle: "单击选窗口，拖动自由框选", icon: "viewfinder", shortcut: state.shortcutLabel(.region)) { state.capture?(.region) }
+                .disabled(state.recordingBusy)
             actionCard("全屏截图", subtitle: "截取鼠标所在屏幕", icon: "display", shortcut: state.shortcutLabel(.fullscreen)) { state.capture?(.fullscreen) }
+                .disabled(state.recordingBusy)
+            actionCard(state.recordingTitle, subtitle: "选区域、窗口或全屏录制", icon: "record.circle", shortcut: state.shortcutLabel(.recording)) { state.recordScreen?() }
             actionCard("打开图片", subtitle: "为已有图片添加标注", icon: "photo.badge.plus", shortcut: "⌘ O") { state.importImage?() }
         }
     }

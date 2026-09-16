@@ -22,7 +22,6 @@ public enum RectCorner: CaseIterable, Equatable {
 
 public enum RectEdge: CaseIterable, Equatable {
     case top, bottom, left, right
-    public var isHorizontal: Bool { self == .top || self == .bottom }
 }
 
 public enum RectResizeHandle: Equatable {
@@ -49,29 +48,21 @@ public enum InteractionGeometry {
                               bounds: CGRect, minimum: CGFloat = 3, square: Bool = false) -> CGRect {
         switch handle {
         case .corner(let corner): return resize(rect, corner: corner, to: point, bounds: bounds, minimum: minimum, square: square)
-        case .edge(let edge):
-            let horizontal = edge.isHorizontal
-            let leading = edge == .top || edge == .left
-            let anchor = horizontal ? (leading ? rect.maxY : rect.minY) : (leading ? rect.maxX : rect.minX)
-            let lower = horizontal ? bounds.minY : bounds.minX, upper = horizontal ? bounds.maxY : bounds.maxX
-            var moved = min(max(horizontal ? point.y : point.x, lower), upper)
-            if abs(moved - anchor) < minimum {
-                let direction: CGFloat = moved == anchor ? (leading ? -1 : 1) : (moved < anchor ? -1 : 1)
-                moved = anchor + direction * minimum
-                if moved < lower || moved > upper { moved = anchor - direction * minimum }
-            }
-            guard moved >= lower, moved <= upper, abs(moved - anchor) >= minimum else { return rect }
-            // A side drag changes one axis, including when Shift is held.
-            return horizontal
-                ? CGRect(x: rect.minX, y: min(moved, anchor), width: rect.width, height: abs(moved - anchor))
-                : CGRect(x: min(moved, anchor), y: rect.minY, width: abs(moved - anchor), height: rect.height)
+        case .edge:
+            // Edge drags translate the whole rectangle; size changes are corner-only.
+            let dx = min(max(point.x - rect.minX, bounds.minX - rect.minX), bounds.maxX - rect.maxX)
+            let dy = min(max(point.y - rect.minY, bounds.minY - rect.minY), bounds.maxY - rect.maxY)
+            return rect.offsetBy(dx: dx, dy: dy)
         }
     }
 
     public static func corner(at point: CGPoint, rect: CGRect, radius: CGFloat) -> RectCorner? {
-        RectCorner.allCases.first { corner in
+        RectCorner.allCases.filter { corner in
             let center = corner.point(in: rect)
             return abs(center.x - point.x) <= radius && abs(center.y - point.y) <= radius
+        }.min { lhs, rhs in
+            let a = lhs.point(in: rect), b = rhs.point(in: rect)
+            return hypot(a.x - point.x, a.y - point.y) < hypot(b.x - point.x, b.y - point.y)
         }
     }
 

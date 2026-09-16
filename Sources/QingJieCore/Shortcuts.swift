@@ -1,9 +1,9 @@
 import Foundation
 
 public enum CaptureShortcutAction: String, CaseIterable, Codable, Sendable {
-    case region, fullscreen
+    case region, fullscreen, recording
     public var title: String {
-        switch self { case .region: return "区域截图"; case .fullscreen: return "全屏截图" }
+        switch self { case .region: return "区域截图"; case .fullscreen: return "全屏截图"; case .recording: return "开始 / 停止录屏" }
     }
 }
 
@@ -48,14 +48,35 @@ public struct CaptureShortcut: Codable, Hashable, Sendable {
 public struct ShortcutConfiguration: Codable, Equatable, Sendable {
     public var region: CaptureShortcut?
     public var fullscreen: CaptureShortcut?
-    public init(region: CaptureShortcut?, fullscreen: CaptureShortcut?) {
-        self.region = region; self.fullscreen = fullscreen
+    public var recording: CaptureShortcut?
+    public init(region: CaptureShortcut?, fullscreen: CaptureShortcut?, recording: CaptureShortcut? = nil) {
+        self.region = region; self.fullscreen = fullscreen; self.recording = recording
     }
     public static let defaults = Self(region: .init(keyCode: 0, modifiers: [.option, .shift]),
-                                      fullscreen: .init(keyCode: 3, modifiers: [.option, .shift]))
+                                      fullscreen: .init(keyCode: 3, modifiers: [.option, .shift]),
+                                      recording: .init(keyCode: 15, modifiers: [.option, .shift]))
+    private enum CodingKeys: String, CodingKey { case region, fullscreen, recording }
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        region = try values.decodeIfPresent(CaptureShortcut.self, forKey: .region)
+        fullscreen = try values.decodeIfPresent(CaptureShortcut.self, forKey: .fullscreen)
+        // Missing means an old version; explicit null means the user disabled it.
+        if values.contains(.recording) {
+            recording = try values.decodeIfPresent(CaptureShortcut.self, forKey: .recording)
+        } else {
+            let proposed = Self.defaults.recording
+            recording = proposed == region || proposed == fullscreen ? nil : proposed
+        }
+    }
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(region, forKey: .region)
+        try values.encode(fullscreen, forKey: .fullscreen)
+        try values.encode(recording, forKey: .recording)
+    }
     public subscript(_ action: CaptureShortcutAction) -> CaptureShortcut? {
-        get { switch action { case .region: return region; case .fullscreen: return fullscreen } }
-        set { switch action { case .region: region = newValue; case .fullscreen: fullscreen = newValue } }
+        get { switch action { case .region: return region; case .fullscreen: return fullscreen; case .recording: return recording } }
+        set { switch action { case .region: region = newValue; case .fullscreen: fullscreen = newValue; case .recording: recording = newValue } }
     }
     public var validationMessage: String? {
         var used: [CaptureShortcut: CaptureShortcutAction] = [:]
@@ -77,7 +98,7 @@ public struct ShortcutStore {
         guard let data = defaults.data(forKey: Self.key), let configuration = try? JSONDecoder().decode(ShortcutConfiguration.self, from: data),
               configuration.validationMessage == nil else { return .defaults }
         // Older versions also stored a scrolling binding. Ignore/remove only that retired field.
-        if let legacy = try? JSONSerialization.jsonObject(with: data) as? [String: Any], legacy["scrolling"] != nil,
+        if let legacy = try? JSONSerialization.jsonObject(with: data) as? [String: Any], legacy["scrolling"] != nil || legacy["recording"] == nil,
            let migrated = try? JSONEncoder().encode(configuration) { defaults.set(migrated, forKey: Self.key) }
         return configuration
     }

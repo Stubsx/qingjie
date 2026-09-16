@@ -11,7 +11,7 @@ struct ShortcutSettingsView: View {
         VStack(alignment: .leading, spacing: 20) {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("截图快捷键").font(.system(size: 24, weight: .semibold))
+                    Text("快捷键").font(.system(size: 24, weight: .semibold))
                     Text("点击右侧按键录入新组合。")
                         .font(.system(size: 12)).foregroundStyle(Theme.secondary)
                 }
@@ -25,7 +25,7 @@ struct ShortcutSettingsView: View {
                     HStack(spacing: 14) {
                         VStack(alignment: .leading, spacing: 5) {
                             Text(action.title).font(.system(size: 14, weight: .medium))
-                            Text(action == .region ? "框选后可标注或开始长截图" : "截取鼠标所在屏幕")
+                            Text(action == .region ? "框选后可标注或开始长截图" : (action == .fullscreen ? "截取鼠标所在屏幕" : "选择范围开始录制，再按一次停止保存"))
                                 .font(.system(size: 11)).foregroundStyle(Theme.secondary)
                             if hotKeys.failures[action] != nil && hotKeys.recording == nil {
                                 Text("注册失败（状态码 \(hotKeys.failures[action] ?? 0)），请更换组合或关闭占用它的应用。")
@@ -42,7 +42,7 @@ struct ShortcutSettingsView: View {
                             .disabled(hotKeys.configuration[action] == nil || hotKeys.recording != nil)
                     }.padding(18)
                     if choosing == action { shortcutChooser(for: action).padding(.horizontal, 18).padding(.bottom, 18) }
-                    if action != .fullscreen { Divider().padding(.horizontal, 18) }
+                    if action != .recording { Divider().padding(.horizontal, 18) }
                 }
             }.background(.white, in: RoundedRectangle(cornerRadius: 12))
             Text(hotKeys.message).font(.system(size: 12)).foregroundStyle(hotKeys.isError ? .orange : Theme.green)
