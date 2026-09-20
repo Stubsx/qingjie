@@ -153,9 +153,9 @@ final class InlineCaptureView: NSView {
         Raster.draw(screenshot, in: bounds, context: context)
         context.setFillColor(NSColor.black.withAlphaComponent(0.46).cgColor); context.fill(bounds)
         context.setStrokeColor(NSColor(calibratedRed: 0.73, green: 0.94, blue: 0.62, alpha: 1).cgColor)
-        let radius = captureAppearance.roundedCorners ? min(captureAppearance.cornerRadius, min(selection.width, selection.height) / 2) + 1 : 0
-        context.setLineWidth(2)
-        context.addPath(CGPath(roundedRect: selection.insetBy(dx: -1, dy: -1), cornerWidth: radius, cornerHeight: radius, transform: nil))
+        let radius = captureAppearance.roundedCorners ? min(captureAppearance.cornerRadius, min(selection.width, selection.height) / 2) + 1.5 : 0
+        context.setLineWidth(3)
+        context.addPath(CGPath(roundedRect: selection.insetBy(dx: -1.5, dy: -1.5), cornerWidth: radius, cornerHeight: radius, transform: nil))
         context.strokePath()
     }
     override func viewDidMoveToWindow() {

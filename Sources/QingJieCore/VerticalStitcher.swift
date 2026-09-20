@@ -1,15 +1,18 @@
 import Foundation
 import CoreGraphics
+import QingJiePNG
 
 public enum StitchError: Error, LocalizedError {
-    case invalidImage, invalidRegion, differentSize, allocationFailed, limitReached
+    case invalidImage, invalidRegion, differentSize, allocationFailed, limitReached, storageUnavailable, storageFull
     public var errorDescription: String? {
         switch self {
         case .invalidImage: return "截取区域太小，请选择至少 80 × 100 像素的滚动内容。"
         case .invalidRegion: return "内容区必须在截图内，且至少为 80 × 100 像素。"
         case .differentSize: return "截图尺寸发生变化，请保持窗口大小和显示器缩放不变。"
         case .allocationFailed: return "无法分配图片内存，请缩小截图区域后重试。"
-        case .limitReached: return "已达到长截图长度上限，请完成当前截图后另起一张。"
+        case .limitReached: return "这张图片已达到可保存的尺寸，请完成当前截图。"
+        case .storageUnavailable: return "暂时无法保存新增内容，请重试或完成已捕获部分。"
+        case .storageFull: return "磁盘空间不足，请完成当前截图并释放一些空间。"
         }
     }
 }
@@ -183,13 +186,14 @@ public struct ScrollFingerprint: Sendable {
     }
 }
 
-/// Stores only new, independently owned strips; old screenshot buffers are not retained per frame.
+/// Stores independently owned strips and refreshes the viewport edge from overlapping content.
+/// Old screenshot buffers are not retained per frame.
 public final class VerticalStitcher {
     public struct Limits: Sendable {
         public var maximumPixels: Int
         public var maximumHeight: Int
         public var maximumFrames: Int
-        public init(maximumPixels: Int = 32_000_000, maximumHeight: Int = 40_000, maximumFrames: Int = 1_000) {
+        public init(maximumPixels: Int = Int.max / 16, maximumHeight: Int = Int(Int32.max), maximumFrames: Int = Int.max) {
             self.maximumPixels = maximumPixels; self.maximumHeight = maximumHeight; self.maximumFrames = maximumFrames
         }
     }
@@ -209,25 +213,60 @@ public final class VerticalStitcher {
     private let sourceHeight: Int
     private let automaticSides: Bool
     private let limits: Limits
+    private let storage: ScrollImageStorage
+    public var usesDiskCache: Bool { storage.hasSpilled }
+    public var residentImageBytes: Int { storage.residentBytes }
+    public var prefersFileExport: Bool {
+        storage.shouldStream || totalHeight > max(1, storage.memoryBudget) / max(1, width * 4)
+    }
     private var previous: ScrollFingerprint
-    private var strips: [CGImage]
-    private var footer: CGImage?
+    private struct Strip {
+        let raster: ScrollImageStorage.Raster
+        let scrollbar: ScrollBarSample.Mask?
+
+        init(image: CGImage, scrollbar: ScrollBarSample.Mask?, storage: ScrollImageStorage) {
+            raster = storage.keep(image); self.scrollbar = scrollbar
+        }
+        func confirmingScrollbar(storage: ScrollImageStorage) throws -> Strip {
+            guard var mask = scrollbar else { return self }
+            let image = try raster.load()
+            guard let context = CGContext(data: nil, width: image.width, height: image.height, bitsPerComponent: 8,
+                                          bytesPerRow: 0, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                          bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { throw StitchError.allocationFailed }
+            context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+            mask.isConfirmed = true
+            mask.draw(in: context, imageHeight: image.height, offset: 0)
+            guard let cleaned = context.makeImage() else { throw StitchError.allocationFailed }
+            // Clean at source resolution once, before previews interpolate pixels.
+            // Otherwise a downscaled thumb can leave a halo outside the mask.
+            return Strip(image: cleaned, scrollbar: nil, storage: storage)
+        }
+        func keepingFirstRows(_ height: Int, storage: ScrollImageStorage) throws -> Strip {
+            let rect = CGRect(x: 0, y: 0, width: raster.width, height: height)
+            return Strip(image: try VerticalStitcher.copy(raster.load(), rect: rect),
+                         scrollbar: scrollbar?.cropped(to: rect), storage: storage)
+        }
+    }
+    private var strips: [Strip]
+    private var footer: Strip?
+    private var previousScrollbar: ScrollBarSample
     private var edges: (top: Int, bottom: Int)?
     private struct TailCheckpoint {
         let previous: ScrollFingerprint
-        let stripCount: Int
-        let firstStrip: CGImage
-        let footer: CGImage?
+        let strips: [Strip]
+        let footer: Strip?
         let edges: (top: Int, bottom: Int)?
         let region: CGRect
         let height: Int
         let count: Int
         let recognized: Bool
+        let scrollbar: ScrollBarSample
     }
     private var quietTailCheckpoint: TailCheckpoint?
 
     /// A manual region disables automatic side cropping, preserving its exact horizontal bounds.
-    public init(first: CGImage, contentRegion: CGRect? = nil, limits: Limits = Limits()) throws {
+    public init(first: CGImage, contentRegion: CGRect? = nil, limits: Limits = Limits(),
+                memoryBudget: Int? = nil, temporaryRoot: URL? = nil) throws {
         let bounds = CGRect(x: 0, y: 0, width: first.width, height: first.height)
         let region = contentRegion ?? bounds
         guard region.minX.isFinite, region.minY.isFinite, region.width.isFinite, region.height.isFinite,
@@ -238,25 +277,29 @@ public final class VerticalStitcher {
         sourceWidth = first.width; sourceHeight = first.height
         outputRegion = region; totalHeight = Int(region.height); self.limits = limits
         automaticSides = contentRegion == nil
-        strips = [firstContent]
+        previousScrollbar = try ScrollBarSample(image: firstContent)
+        storage = ScrollImageStorage(memoryBudget: memoryBudget, temporaryRoot: temporaryRoot)
+        strips = [Strip(image: firstContent, scrollbar: previousScrollbar.mask, storage: storage)]
+        try storage.trim()
     }
 
     @discardableResult public func append(_ image: CGImage, focusPoint: CGPoint? = nil, allowQuietTail: Bool = true) throws -> StitchOutcome {
+        try storage.trim()
         guard image.width == sourceWidth, image.height == sourceHeight else { throw StitchError.differentSize }
-        var candidateRegion = automaticSides && edges == nil ? try ScrollLayout.horizontalContent(first: strips[0], next: image) : outputRegion
+        var candidateRegion = automaticSides && edges == nil ? try ScrollLayout.horizontalContent(first: strips[0].raster.load(), next: image) : outputRegion
         guard var content = image.cropping(to: candidateRegion) else { throw StitchError.invalidRegion }
         var next = try ScrollFingerprint(image: content)
         var reference: ScrollFingerprint
         if candidateRegion != outputRegion {
-            guard let initial = strips[0].cropping(to: candidateRegion) else { throw StitchError.invalidRegion }
+            guard let initial = try strips[0].raster.load().cropping(to: candidateRegion) else { throw StitchError.invalidRegion }
             reference = try ScrollFingerprint(image: initial)
         } else { reference = previous }
         var insets = edges ?? reference.fixedEdges(comparedTo: next)
         var matchedShift = reference.distance(to: next) < 0.35 ? 0 : reference.displacement(to: next, top: insets.top, bottom: insets.bottom)
         var recognizedMotion = false
         if automaticSides && edges == nil && reference.distance(to: next) >= 0.35,
-           let proposal = try ScrollMotionDetector.detect(first: strips[0], next: image, focus: focusPoint),
-           let oldContent = strips[0].cropping(to: proposal.region), let newContent = image.cropping(to: proposal.region) {
+           let proposal = try ScrollMotionDetector.detect(first: strips[0].raster.load(), next: image, focus: focusPoint),
+           let oldContent = try strips[0].raster.load().cropping(to: proposal.region), let newContent = image.cropping(to: proposal.region) {
             let old = try ScrollFingerprint(image: oldContent), new = try ScrollFingerprint(image: newContent)
             let borders = old.fixedEdges(comparedTo: new)
             // A local vote alone is insufficient: validate the whole proposed pane before changing state.
@@ -270,7 +313,7 @@ public final class VerticalStitcher {
             if let checkpoint = quietTailCheckpoint {
                 // A held rubber-band can look stable. Reclaim only the flat tail if
                 // it subsequently springs back; already confirmed content is untouched.
-                strips.removeLast(strips.count - checkpoint.stripCount); strips[0] = checkpoint.firstStrip
+                strips = checkpoint.strips; previousScrollbar = checkpoint.scrollbar
                 previous = checkpoint.previous; footer = checkpoint.footer; edges = checkpoint.edges
                 outputRegion = checkpoint.region; totalHeight = checkpoint.height; frameCount = checkpoint.count
                 usesMotionRecognition = checkpoint.recognized; quietTailCheckpoint = nil
@@ -288,21 +331,144 @@ public final class VerticalStitcher {
         guard totalHeight + shift <= limits.maximumHeight, totalHeight + shift <= limits.maximumPixels / contentWidth,
               frameCount < limits.maximumFrames else { return .limitReached }
         let end = contentHeight - insets.bottom
-        let addition = try Self.copy(content, rect: CGRect(x: 0, y: end - shift, width: contentWidth, height: shift))
-        let newFooter = insets.bottom > 0 ? try Self.copy(content, rect: CGRect(x: 0, y: end, width: contentWidth, height: insets.bottom)) : nil
-        if quietTail && quietTailCheckpoint == nil {
-            quietTailCheckpoint = TailCheckpoint(previous: previous, stripCount: strips.count, firstStrip: strips[0], footer: footer,
-                                                 edges: edges, region: outputRegion, height: totalHeight, count: frameCount, recognized: usesMotionRecognition)
-        } else if !quietTail { quietTailCheckpoint = nil }
+        // Display capture already contains the source window's rounded corners.
+        // Joining at the old viewport bottom would repeat those corners (and the
+        // desktop behind them) in every strip. Move the join into the overlap so
+        // the next frame replaces that edge with actual document pixels. Keep
+        // clear of the next frame's top edge too, and bound the rewritten tail.
+        let overlap = end - insets.top - shift
+        let refreshedRows = min(128, overlap / 2)
+        let additionRegion = CGRect(x: 0, y: end - shift - refreshedRows,
+                                    width: contentWidth, height: shift + refreshedRows)
+        let footerRegion = CGRect(x: 0, y: end, width: contentWidth, height: insets.bottom)
+        let addition = try Self.copy(content, rect: additionRegion)
+        let newFooter = insets.bottom > 0 ? try Self.copy(content, rect: footerRegion) : nil
+        let scrollbar = try ScrollBarSample(image: content)
+        var oldScrollbar = previousScrollbar
+        if candidateRegion != outputRegion {
+            let initialRegion = candidateRegion.offsetBy(dx: -outputRegion.minX, dy: -outputRegion.minY)
+            guard let initial = try strips[0].raster.load().cropping(to: initialRegion) else { throw StitchError.invalidRegion }
+            oldScrollbar = try ScrollBarSample(image: initial)
+        }
+        let checkpoint = quietTail && quietTailCheckpoint == nil ?
+            TailCheckpoint(previous: previous, strips: strips, footer: footer,
+                           edges: edges, region: outputRegion, height: totalHeight, count: frameCount,
+                           recognized: usesMotionRecognition, scrollbar: previousScrollbar) : nil
+        var initialStrip = strips[0]
         if edges == nil {
             // Commit the layout only after a reliable forward match. Rejected frames cannot crop the result.
             let x = candidateRegion.minX - outputRegion.minX
-            strips[0] = try Self.copy(strips[0], rect: CGRect(x: x, y: 0, width: CGFloat(contentWidth), height: CGFloat(end)))
+            initialStrip = Strip(image: try Self.copy(strips[0].raster.load(), rect: CGRect(x: x, y: 0, width: CGFloat(contentWidth), height: CGFloat(end))),
+                                 scrollbar: oldScrollbar.mask?.cropped(to: CGRect(x: 0, y: 0, width: contentWidth, height: end)), storage: storage)
         }
-        strips.append(addition); footer = newFooter; edges = insets; previous = next; outputRegion = candidateRegion
+        // Confirm each observed thumb, not every future mark in the same column.
+        // This also removes the first frame's thumb once a later frame proves it.
+        var lastStrip = strips.count == 1 ? initialStrip : strips[strips.count - 1]
+        var newStrip = Strip(image: addition, scrollbar: scrollbar.mask?.cropped(to: additionRegion), storage: storage)
+        var footerStrip = newFooter.map { Strip(image: $0, scrollbar: scrollbar.mask?.cropped(to: footerRegion), storage: storage) }
+        if oldScrollbar.confirmedTrack(comparedTo: scrollbar, shift: shift) != nil {
+            lastStrip = try lastStrip.confirmingScrollbar(storage: storage)
+            newStrip = try newStrip.confirmingScrollbar(storage: storage)
+            footerStrip = try footerStrip?.confirmingScrollbar(storage: storage)
+        }
+        var updatedStrips = strips
+        updatedStrips[0] = initialStrip; updatedStrips[updatedStrips.count - 1] = lastStrip
+        var remaining = refreshedRows
+        while remaining > 0, let tail = updatedStrips.popLast() {
+            if tail.raster.height > remaining {
+                updatedStrips.append(try tail.keepingFirstRows(tail.raster.height - remaining, storage: storage))
+                remaining = 0
+            } else { remaining -= tail.raster.height }
+        }
+        updatedStrips.append(newStrip)
+        // Persist before committing matching state, so a failed write can be retried.
+        try storage.trim()
+        if let checkpoint { quietTailCheckpoint = checkpoint } else if !quietTail { quietTailCheckpoint = nil }
+        strips = updatedStrips; footer = footerStrip; edges = insets; previous = next; outputRegion = candidateRegion
+        previousScrollbar = scrollbar
         usesMotionRecognition = usesMotionRecognition || recognizedMotion
         totalHeight += shift; frameCount += 1
         return .appended(shift)
+    }
+
+    @discardableResult public func exportPDF(to url: URL, checkCancellation: () throws -> Void = {}) throws -> Int {
+        try storage.trim()
+        let all = strips + (footer.map { [$0] } ?? [])
+        var offsets: [Int] = [], offset = 0
+        for strip in all { offsets.append(offset); offset += strip.raster.height }
+        guard offset == totalHeight else { throw StitchError.allocationFailed }
+        return try ScreenshotPDF.write(to: url, width: width, height: totalHeight, checkCancellation: checkCancellation) { context, rows in
+            var low = 0, high = all.count
+            while low < high {
+                let middle = (low + high) / 2
+                if offsets[middle] + all[middle].raster.height <= rows.lowerBound { low = middle + 1 }
+                else { high = middle }
+            }
+            var index = low
+            while index < all.count && offsets[index] < rows.upperBound {
+                try autoreleasepool {
+                    let raster = all[index].raster
+                    context.draw(try raster.load(), in: CGRect(x: 0, y: rows.upperBound - offsets[index] - raster.height,
+                                                               width: width, height: raster.height))
+                }
+                index += 1
+            }
+        }
+    }
+
+    /// Large exports never allocate a bitmap the size of the entire document.
+    public func exportPNG(appearance: ScreenshotAppearance = .init(), pixelsPerPoint: CGFloat = 1,
+                          checkCancellation: () throws -> Void = {}) throws -> ScrollPNGFile {
+        let directory = try storage.workspace()
+        let padding = try appearance.padding(pixelsPerPoint: pixelsPerPoint)
+        let outputWidth = width + padding * 2, outputHeight = totalHeight + padding * 2
+        guard outputWidth > 0, outputWidth <= 0x1fffffff, outputHeight > 0, outputHeight <= Int(Int32.max),
+              outputHeight <= Int.max / outputWidth / 4 else { throw StitchError.limitReached }
+        try directory.checkSpace(for: min(outputHeight, 512) * outputWidth * 4)
+        let url = directory.url.appendingPathComponent(UUID().uuidString + ".png")
+        var succeeded = false
+        defer { if !succeeded { try? FileManager.default.removeItem(at: url) } }
+        guard let encoder = qj_png_open(url.path, UInt32(outputWidth), UInt32(outputHeight)) else { throw StitchError.storageUnavailable }
+        defer { qj_png_destroy(encoder) }
+        let all = strips + (footer.map { [$0] } ?? [])
+        var offsets: [Int] = [], offset = 0
+        for strip in all { offsets.append(offset); offset += strip.raster.height }
+        guard offset == totalHeight else { throw StitchError.allocationFailed }
+        let overlap = padding
+        let rowsPerBand = min(512, max(1, 8 * 1024 * 1024 / (outputWidth * 4) - overlap * 2))
+        var firstStrip = 0
+        for top in stride(from: 0, to: outputHeight, by: rowsPerBand) {
+            try checkCancellation()
+            if (top / rowsPerBand) % 16 == 0 { try directory.checkSpace(for: rowsPerBand * outputWidth * 4) }
+            try autoreleasepool {
+                let rows = min(rowsPerBand, outputHeight - top), bandHeight = rows + overlap * 2
+                guard let context = CGContext(data: nil, width: outputWidth, height: bandHeight,
+                                              bitsPerComponent: 8, bytesPerRow: outputWidth * 4,
+                                              space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue),
+                      let data = context.data else { throw StitchError.allocationFailed }
+                context.translateBy(x: 0, y: CGFloat(overlap - (outputHeight - top - rows)))
+                let contentTop = top - overlap - padding, contentBottom = top + rows + overlap - padding
+                while firstStrip < all.count && offsets[firstStrip] + all[firstStrip].raster.height <= contentTop { firstStrip += 1 }
+                try appearance.draw(in: context, imageSize: CGSize(width: width, height: totalHeight), pixelsPerPoint: pixelsPerPoint) { rect in
+                    var index = firstStrip
+                    while index < all.count && offsets[index] < contentBottom {
+                        try autoreleasepool {
+                            let raster = all[index].raster, image = try raster.load()
+                            context.draw(image, in: CGRect(x: rect.minX, y: rect.maxY - CGFloat(offsets[index] + raster.height),
+                                                           width: CGFloat(width), height: CGFloat(raster.height)))
+                        }
+                        index += 1
+                    }
+                }
+                let pixels = data.advanced(by: overlap * context.bytesPerRow).assumingMemoryBound(to: UInt8.self)
+                guard qj_png_rows(encoder, pixels, context.bytesPerRow, UInt32(rows)) != 0 else { throw StitchError.storageUnavailable }
+            }
+        }
+        try checkCancellation()
+        guard qj_png_finish(encoder) != 0 else { throw StitchError.storageUnavailable }
+        succeeded = true
+        return ScrollPNGFile(directory: directory, url: url)
     }
 
     public func compose() throws -> CGImage {
@@ -310,7 +476,8 @@ public final class VerticalStitcher {
               let context = CGContext(data: nil, width: width, height: totalHeight, bitsPerComponent: 8, bytesPerRow: 0,
                                       space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { throw StitchError.allocationFailed }
         var offset = 0
-        for part in strips + (footer.map { [$0] } ?? []) {
+        for strip in strips + (footer.map { [$0] } ?? []) {
+            let part = try strip.raster.load()
             context.draw(part, in: CGRect(x: 0, y: totalHeight - offset - part.height, width: width, height: part.height))
             offset += part.height
         }
@@ -334,8 +501,12 @@ public final class VerticalStitcher {
         context.interpolationQuality = .high
         context.scaleBy(x: CGFloat(w) / CGFloat(width), y: CGFloat(h) / CGFloat(totalHeight))
         var offset = 0
-        for part in strips + (footer.map { [$0] } ?? []) {
-            context.draw(part, in: CGRect(x: 0, y: totalHeight - offset - part.height, width: width, height: part.height)); offset += part.height
+        for strip in strips + (footer.map { [$0] } ?? []) {
+            try autoreleasepool {
+                let part = try strip.raster.load(previewWidth: w)
+                context.draw(part, in: CGRect(x: 0, y: totalHeight - offset - strip.raster.height, width: width, height: strip.raster.height))
+            }
+            offset += strip.raster.height
         }
         guard let image = context.makeImage() else { throw StitchError.allocationFailed }; return image
     }

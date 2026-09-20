@@ -149,10 +149,17 @@ struct HomeView: View {
                         Button { state.openHistory?(item.url) } label: {
                             VStack(alignment: .leading, spacing: 8) {
                                 Image(nsImage: item.thumbnail).resizable().scaledToFit().frame(maxWidth: .infinity).frame(height: 120).background(Theme.background)
+                                    .overlay(alignment: .topTrailing) {
+                                        if let pages = item.pageCount {
+                                            Text("PDF · \(pages) 页").font(.system(size: 10, weight: .medium))
+                                                .padding(.horizontal, 7).padding(.vertical, 4)
+                                                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 5)).padding(6)
+                                        }
+                                    }
                                 Text(item.date.formatted(date: .abbreviated, time: .shortened)).font(.system(size: 10)).foregroundStyle(Theme.secondary).padding(.horizontal, 10).padding(.bottom, 10)
                             }.background(.white, in: RoundedRectangle(cornerRadius: 10)).clipShape(RoundedRectangle(cornerRadius: 10))
                         }.buttonStyle(.plain).contextMenu {
-                            Button("打开编辑") { state.openHistory?(item.url) }
+                            Button(item.isPDF ? "打开 PDF" : "打开编辑") { state.openHistory?(item.url) }
                             Button("在访达中显示") { NSWorkspace.shared.activateFileViewerSelecting([item.url]) }
                             Button("从最近截图移除", role: .destructive) { state.deleteHistory(item) }
                         }

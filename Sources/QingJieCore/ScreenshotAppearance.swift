@@ -43,7 +43,26 @@ public struct ScreenshotAppearance: Equatable, Sendable {
         guard let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
                                       bytesPerRow: 0, space: CGColorSpace(name: CGColorSpace.sRGB)!,
                                       bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { throw AppearanceError.allocation }
-        let rect = CGRect(x: padding, y: padding, width: CGFloat(image.width), height: CGFloat(image.height))
+        try draw(in: context, imageSize: CGSize(width: image.width, height: image.height), pixelsPerPoint: pixelsPerPoint) { rect in
+            context.draw(image, in: rect)
+        }
+        guard let result = context.makeImage() else { throw AppearanceError.allocation }
+        return result
+    }
+
+    // Shared geometry keeps ordinary screenshots and banded long exports identical.
+    func padding(pixelsPerPoint: CGFloat) throws -> Int {
+        guard pixelsPerPoint.isFinite, pixelsPerPoint > 0, pixelsPerPoint <= 8 else { throw AppearanceError.invalidScale }
+        let hasShadow = shadow && shadowOpacity > 0 && (shadowBlur > 0 || shadowOffset > 0)
+        return hasShadow ? Int(ceil((shadowBlur * 3 + shadowOffset) * pixelsPerPoint)) : 0
+    }
+    func draw(in context: CGContext, imageSize: CGSize, pixelsPerPoint: CGFloat,
+              drawContent: (CGRect) throws -> Void) throws {
+        let hasShadow = shadow && shadowOpacity > 0 && (shadowBlur > 0 || shadowOffset > 0)
+        let blur = shadowBlur * pixelsPerPoint, offset = shadowOffset * pixelsPerPoint
+        let padding = CGFloat(try padding(pixelsPerPoint: pixelsPerPoint))
+        let width = imageSize.width + padding * 2, height = imageSize.height + padding * 2
+        let rect = CGRect(x: padding, y: padding, width: imageSize.width, height: imageSize.height)
         let radius = roundedCorners ? min(cornerRadius * pixelsPerPoint, min(rect.width, rect.height) / 2) : 0
         let path = CGPath(roundedRect: rect, cornerWidth: radius, cornerHeight: radius, transform: nil)
         if hasShadow {
@@ -59,9 +78,7 @@ public struct ScreenshotAppearance: Equatable, Sendable {
         }
         context.addPath(path); context.clip()
         context.interpolationQuality = .none
-        context.draw(image, in: rect)
-        guard let result = context.makeImage() else { throw AppearanceError.allocation }
-        return result
+        try drawContent(rect)
     }
 
     public enum AppearanceError: LocalizedError {

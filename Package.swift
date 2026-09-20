@@ -6,7 +6,8 @@ let package = Package(
     platforms: [.macOS(.v14)],
     products: [.executable(name: "QingJie", targets: ["QingJie"])],
     targets: [
-        .target(name: "QingJieCore"),
+        .target(name: "QingJiePNG", linkerSettings: [.linkedLibrary("z")]),
+        .target(name: "QingJieCore", dependencies: ["QingJiePNG"]),
         .executableTarget(name: "QingJie", dependencies: ["QingJieCore"]),
         .testTarget(name: "QingJieCoreTests", dependencies: ["QingJieCore"])
     ]

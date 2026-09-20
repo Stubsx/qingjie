@@ -91,15 +91,17 @@ final class VerticalStitcherTests: XCTestCase {
     }
 
     func testHeldElasticTailIsReclaimedWhenItSpringsBack() throws {
-        let stitcher = try VerticalStitcher(first: frame(offset: 0, header: 42, footer: 39))
-        _ = try stitcher.append(frame(offset: 200, header: 42, footer: 39))
-        let expected = pixels(try stitcher.compose())
-        let held = elasticFrame(offset: 227, blank: 27, header: 42, footer: 39)
-        XCTAssertEqual(try stitcher.append(held), .appended(27))
-        XCTAssertEqual(try stitcher.append(held), .unchanged)
-        XCTAssertEqual(try stitcher.append(frame(offset: 200, header: 42, footer: 39)), .unchanged)
-        XCTAssertEqual(stitcher.totalHeight, 840)
-        XCTAssertEqual(pixels(try stitcher.compose()), expected)
+        for budget: Int? in [nil, 0] {
+            let stitcher = try VerticalStitcher(first: frame(offset: 0, header: 42, footer: 39), memoryBudget: budget)
+            _ = try stitcher.append(frame(offset: 200, header: 42, footer: 39))
+            let expected = pixels(try stitcher.compose())
+            let held = elasticFrame(offset: 227, blank: 27, header: 42, footer: 39)
+            XCTAssertEqual(try stitcher.append(held), .appended(27))
+            XCTAssertEqual(try stitcher.append(held), .unchanged)
+            XCTAssertEqual(try stitcher.append(frame(offset: 200, header: 42, footer: 39)), .unchanged)
+            XCTAssertEqual(stitcher.totalHeight, 840)
+            XCTAssertEqual(pixels(try stitcher.compose()), expected)
+        }
     }
 
     func testElasticTailWithFixedChromeDoesNotDuplicateFooter() throws {
@@ -324,5 +326,115 @@ final class VerticalStitcherTests: XCTestCase {
         let stitcher = try VerticalStitcher(first: first)
         XCTAssertEqual(try stitcher.append(twoPanes(leftOffset: 117, rightOffset: 169)), .noOverlap)
         XCTAssertEqual(pixels(try stitcher.compose()), pixels(first))
+    }
+
+    private func gutterFrame(offset: Int, height: Int = 640, width: Int = 320, thumbY: Int? = nil,
+                             dark: Bool = false, documentMarkY: Int? = nil, colored: Bool = false,
+                             scale: Int = 1, header: Int = 0, footer: Int = 0) -> CGImage {
+        let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width * 4,
+                                space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        context.draw(frame(offset: offset, height: height, width: width, header: header, footer: footer), in: CGRect(x: 0, y: 0, width: width, height: height))
+        context.setFillColor(CGColor(gray: dark ? 0.12 : 0.97, alpha: 1))
+        context.fill(CGRect(x: width - 40 * scale, y: 0, width: 40 * scale, height: height))
+        for y in [thumbY, documentMarkY.map { $0 - offset }].compactMap({ $0 }) {
+            context.setFillColor(colored ? CGColor(red: 0.8, green: 0.2, blue: 0.1, alpha: 1) : CGColor(gray: dark ? 0.55 : 0.66, alpha: 1))
+            let rect = CGRect(x: width - 16 * scale, y: height - y - 80 * scale, width: 8 * scale, height: 80 * scale)
+            context.addPath(CGPath(roundedRect: rect, cornerWidth: CGFloat(4 * scale), cornerHeight: CGFloat(4 * scale), transform: nil)); context.fillPath()
+        }
+        return context.makeImage()!
+    }
+
+    func testScrollThumbsAreRemovedFromFirstFrameAndEveryNewStrip() throws {
+        let region = CGRect(x: 0, y: 0, width: 320, height: 640)
+        for dark in [false, true] {
+            let sample = try ScrollBarSample(image: gutterFrame(offset: 0, thumbY: 460, dark: dark))
+            XCTAssertNotNil(sample.mask)
+            let stitcher = try VerticalStitcher(first: gutterFrame(offset: 0, thumbY: 460, dark: dark), contentRegion: region)
+            let reference = try VerticalStitcher(first: gutterFrame(offset: 0, dark: dark), contentRegion: region)
+            for (offset, delta, thumb) in [(160, 160, 470), (300, 140, 510), (490, 190, 548)] {
+                XCTAssertEqual(try stitcher.append(gutterFrame(offset: offset, thumbY: thumb, dark: dark)), .appended(delta))
+                _ = try reference.append(gutterFrame(offset: offset, dark: dark))
+            }
+            XCTAssertEqual(stitcher.width, 320)
+            XCTAssertEqual(pixels(try stitcher.compose()), pixels(gutterFrame(offset: 0, height: 1130, dark: dark)))
+            // Full-size preview exercises the same masks without resampling.
+            XCTAssertEqual(pixels(try stitcher.preview(maximumHeight: 4096, maximumWidth: 640)), pixels(try stitcher.compose()))
+            for size in [(260, 160), (37, 17), (4096, 119), (4096, 213)] {
+                XCTAssertEqual(pixels(try stitcher.preview(maximumHeight: size.0, maximumWidth: size.1)),
+                               pixels(try reference.preview(maximumHeight: size.0, maximumWidth: size.1)))
+            }
+        }
+    }
+
+    func testScrollbarCanAppearAfterCaptureStartsAndFadeOut() throws {
+        let region = CGRect(x: 0, y: 0, width: 320, height: 640)
+        let stitcher = try VerticalStitcher(first: gutterFrame(offset: 0), contentRegion: region)
+        XCTAssertEqual(try stitcher.append(gutterFrame(offset: 60, thumbY: 520)), .appended(60))
+        XCTAssertEqual(try stitcher.append(gutterFrame(offset: 120)), .appended(60))
+        XCTAssertEqual(pixels(try stitcher.compose()), pixels(gutterFrame(offset: 0, height: 760)))
+
+        let fading = try VerticalStitcher(first: gutterFrame(offset: 0, thumbY: 200), contentRegion: region)
+        XCTAssertEqual(try fading.append(gutterFrame(offset: 60)), .appended(60))
+        XCTAssertEqual(pixels(try fading.compose()), pixels(gutterFrame(offset: 0, height: 700)))
+    }
+
+    func testDocumentMarksAtTheRightEdgeArePreserved() throws {
+        let region = CGRect(x: 0, y: 0, width: 320, height: 640)
+        for position in [260, 650] {
+            let stitcher = try VerticalStitcher(first: gutterFrame(offset: 0, documentMarkY: position), contentRegion: region)
+            XCTAssertEqual(try stitcher.append(gutterFrame(offset: 160, documentMarkY: position)), .appended(160))
+            XCTAssertEqual(try stitcher.append(gutterFrame(offset: 300, documentMarkY: position)), .appended(140))
+            XCTAssertEqual(pixels(try stitcher.compose()), pixels(gutterFrame(offset: 0, height: 940, documentMarkY: position)))
+        }
+    }
+
+    func testConfirmedScrollbarDoesNotEraseLaterDocumentMarksInSameColumn() throws {
+        let region = CGRect(x: 0, y: 0, width: 320, height: 640)
+        let stitcher = try VerticalStitcher(first: gutterFrame(offset: 0, thumbY: 140), contentRegion: region)
+        XCTAssertEqual(try stitcher.append(gutterFrame(offset: 60, thumbY: 160)), .appended(60))
+        XCTAssertEqual(try stitcher.append(gutterFrame(offset: 120)), .appended(60))
+        XCTAssertEqual(try stitcher.append(gutterFrame(offset: 280, documentMarkY: 780)), .appended(160))
+        XCTAssertEqual(try stitcher.append(gutterFrame(offset: 400, documentMarkY: 780)), .appended(120))
+        XCTAssertEqual(pixels(try stitcher.compose()), pixels(gutterFrame(offset: 0, height: 1040, documentMarkY: 780)))
+    }
+
+    func testColoredEdgeContentAndUnconfirmedThumbArePreserved() throws {
+        let region = CGRect(x: 0, y: 0, width: 320, height: 640)
+        let first = gutterFrame(offset: 0, thumbY: 200)
+        let stitcher = try VerticalStitcher(first: first, contentRegion: region)
+        XCTAssertEqual(pixels(try stitcher.compose()), pixels(first))
+        XCTAssertEqual(try stitcher.append(gutterFrame(offset: -100, thumbY: 210)), .backwards)
+        XCTAssertEqual(pixels(try stitcher.compose()), pixels(first))
+        XCTAssertEqual(try stitcher.append(gutterFrame(offset: 2000, thumbY: 210)), .noOverlap)
+        XCTAssertEqual(pixels(try stitcher.compose()), pixels(first))
+        XCTAssertNil(try ScrollBarSample(image: gutterFrame(offset: 0, thumbY: 200, colored: true)).mask)
+        XCTAssertNil(try ScrollBarSample(image: gutterFrame(offset: 0, thumbY: 200, documentMarkY: 430)).mask)
+        XCTAssertNil(try ScrollBarSample(image: frame(offset: 0)).mask)
+    }
+
+    func testScrollbarCleanupWorksWithAutomaticLayoutAndRetinaPixels() throws {
+        for scale in [1, 2] {
+            let width = 441 * scale, height = 640 * scale, delta = 160 * scale
+            let stitcher = try VerticalStitcher(first: gutterFrame(offset: 0, height: height, width: width, thumbY: 420 * scale, scale: scale))
+            XCTAssertEqual(try stitcher.append(gutterFrame(offset: delta, height: height, width: width, thumbY: 470 * scale, scale: scale)), .appended(delta))
+            let expected = gutterFrame(offset: 0, height: height + delta, width: width, scale: scale)
+                .cropping(to: CGRect(x: Int(stitcher.outputRegion.minX), y: 0, width: stitcher.width, height: stitcher.totalHeight))!
+            XCTAssertEqual(pixels(try stitcher.compose()), pixels(expected))
+        }
+    }
+
+    func testScrollbarCleanupPreservesManualBoundsAndFixedChrome() throws {
+        for budget: Int? in [nil, 0] {
+            let region = CGRect(x: 40, y: 0, width: 280, height: 640)
+            let stitcher = try VerticalStitcher(first: gutterFrame(offset: 0, thumbY: 440, header: 42, footer: 39), contentRegion: region, memoryBudget: budget)
+            for (offset, thumb) in [(1, 440), (160, 470), (300, 500)] {
+                _ = try stitcher.append(gutterFrame(offset: offset, thumbY: thumb, header: 42, footer: 39))
+            }
+            XCTAssertEqual(stitcher.outputRegion, region)
+            let expected = gutterFrame(offset: 0, height: 940, header: 42, footer: 39)
+                .cropping(to: CGRect(x: 40, y: 0, width: 280, height: 940))!
+            XCTAssertEqual(pixels(try stitcher.compose()), pixels(expected))
+        }
     }
 }

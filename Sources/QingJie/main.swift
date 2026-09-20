@@ -39,7 +39,11 @@ import QingJieCore
         state.capture = { [weak self] in self?.capture($0) }
         state.recordScreen = { [weak self] in self?.recordScreen() }
         state.importImage = { [weak self] in self?.importImage() }
-        state.openHistory = { [weak self] in self?.openImage($0) }
+        state.openHistory = { [weak self] url in
+            if url.pathExtension.lowercased() == "pdf" {
+                if !NSWorkspace.shared.open(url) { self?.state.notice = "无法打开 PDF，请在访达中查看。" }
+            } else { self?.openImage(url) }
+        }
         state.showDemo = { [weak self] in self?.demo() }
         state.showScrollDemo = { [weak self] in
             guard let self, !recordingService.busy else { return }; captureService.showScrollDemo()
@@ -138,6 +142,7 @@ import QingJieCore
     func openEditor(_ image: CGImage) {
         let model = EditorModel(image: image)
         model.onExport = { [weak self] in self?.state.remember($0) }
+        model.onFileExport = { [weak self] in self?.state.remember(.saved($0)) }
         model.onPin = { [weak self] in self?.pin($0) }
         let window = makeWindow(title: "轻截 · 截图标注", size: NSSize(width: 1120, height: 760), content: EditorView(model: model))
         window.delegate = self; window.minSize = NSSize(width: 980, height: 680)

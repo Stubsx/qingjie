@@ -22,8 +22,8 @@ actor ScrollCaptureWorker {
     private var waitingForTail = false
     private var unmatchedSince: TimeInterval?
     var canFinishWithoutNewFrame: Bool { reviewingEarlier || waitingForTail }
-    init(first: CGImage, contentRegion: CGRect? = nil) throws {
-        stitcher = try VerticalStitcher(first: first, contentRegion: contentRegion)
+    init(first: CGImage, contentRegion: CGRect? = nil, memoryBudget: Int? = nil) throws {
+        stitcher = try VerticalStitcher(first: first, contentRegion: contentRegion, memoryBudget: memoryBudget)
     }
     func observe(_ image: CGImage, requireStable: Bool = false, focusPoint: CGPoint? = nil,
                  now: TimeInterval = ProcessInfo.processInfo.systemUptime) throws -> ScrollUpdate {
@@ -59,6 +59,21 @@ actor ScrollCaptureWorker {
     }
     func resetStability() { lastSample = nil; stableSince = nil }
     func compose() throws -> CGImage { try stitcher.compose() }
+    var prefersFileExport: Bool { stitcher.prefersFileExport }
+    func exportPNG(appearance: ScreenshotAppearance, pixelsPerPoint: CGFloat) throws -> ScrollPNGFile {
+        try stitcher.exportPNG(appearance: appearance, pixelsPerPoint: pixelsPerPoint) { try Task.checkCancellation() }
+    }
+    func save(to url: URL, appearance: ScreenshotAppearance, pixelsPerPoint: CGFloat) throws {
+        try Task.checkCancellation()
+        switch ScreenshotFileFormat.forURL(url) {
+        case .pdf: try stitcher.exportPDF(to: url) { try Task.checkCancellation() }
+        case .png:
+            let file = try exportPNG(appearance: appearance, pixelsPerPoint: pixelsPerPoint)
+            try Task.checkCancellation(); try ScreenshotSaver.copyFile(file.url, to: url)
+        case .jpeg:
+            try ScreenshotSaver.write(stitcher.compose(), to: url)
+        }
+    }
     func preview() throws -> CGImage { try stitcher.preview(maximumHeight: 4096, maximumWidth: 640) }
 }
 
@@ -93,8 +108,11 @@ actor ScrollCaptureWorker {
     private var lastFocus: CGPoint?
     private let onComplete: (CGImage?) -> Void
     private let onSaved: (URL) -> Void
+    private let onCopiedPNG: ((URL) -> Bool)?
     private let saver = ScreenshotSaver()
     private var readyImage: CGImage?
+    private var readyPNG: ScrollPNGFile?
+    private var readyForSaving = false
     private var sampling: Task<Void, Never>?
     private var finishingTask: Task<Void, Never>?
     private var panel: NSPanel?
@@ -110,14 +128,17 @@ actor ScrollCaptureWorker {
     private let pixelsPerPoint: CGFloat
 
     init(first: CGImage, isDemo: Bool = false, appearance: ScreenshotAppearance = .init(), pixelsPerPoint: CGFloat = 1,
+         memoryBudget: Int? = nil,
          captureFrame: @escaping () async throws -> CGImage,
          captureFocus: @escaping () -> CGPoint? = { nil }, onSaved: @escaping (URL) -> Void = { _ in },
+         onCopiedPNG: ((URL) -> Bool)? = nil,
          onComplete: @escaping (CGImage?) -> Void) throws {
         sourceSize = CGSize(width: first.width, height: first.height)
         self.appearance = appearance; self.pixelsPerPoint = pixelsPerPoint
         state = ScrollCaptureState(first: first, isDemo: isDemo)
-        worker = try ScrollCaptureWorker(first: first)
+        worker = try ScrollCaptureWorker(first: first, memoryBudget: memoryBudget)
         self.captureFrame = captureFrame; self.captureFocus = captureFocus; self.onComplete = onComplete; self.onSaved = onSaved
+        self.onCopiedPNG = onCopiedPNG
         state.onPause = { [weak self] in self?.togglePause() }
         state.onFinish = { [weak self] in self?.finish() }
         state.onSave = { [weak self] in self?.finish(saveAs: true) }
@@ -176,11 +197,12 @@ actor ScrollCaptureWorker {
     }
 
     private func beginSampling() {
+        sampling?.cancel()
         sampling = Task { [weak self] in
             guard let self else { return }
             if let preview = try? await worker.preview() { state.preview = NSImage(cgImage: preview, size: .zero) }
             while !Task.isCancelled && !closed {
-                if !state.paused {
+                if !state.paused && !state.finishing {
                     do {
                         let image = try await captureFrame()
                         guard !Task.isCancelled, !closed else { return }
@@ -222,6 +244,7 @@ actor ScrollCaptureWorker {
         if let preview = update.preview { state.preview = NSImage(cgImage: preview, size: .zero) }
         switch update.outcome {
         case .appended:
+            readyImage = nil; readyPNG = nil; readyForSaving = false
             state.warning = false; state.note = "已衔接新画面。继续向下滚动，或点击完成。"
         case .unchanged:
             state.warning = false; state.note = "画面未变化。向下滚动即可自动识别和累计。"
@@ -256,7 +279,7 @@ actor ScrollCaptureWorker {
     private func togglePause() {
         guard !state.finishing, !state.atLimit, !state.selectingRegion else { return }
         state.paused.toggle(); state.warning = false
-        if !state.paused { readyImage = nil }
+        if !state.paused { readyImage = nil; readyPNG = nil; readyForSaving = false }
         state.note = state.paused ? "已暂停。恢复前请回到最后捕获的位置。" : "已继续，请缓慢向下滚动。"
         Task { await worker.resetStability() }
     }
@@ -335,10 +358,15 @@ actor ScrollCaptureWorker {
         beginSampling()
     }
 
-    func finish(saveAs: Bool = false, using present: ((CGImage, @escaping (ScreenshotSaver.Outcome) -> Void) -> Void)? = nil) {
+    func finish(saveAs: Bool = false,
+                usingExport exportPresenter: (([ScreenshotFileFormat], @escaping (URL) async throws -> Void, @escaping (ScreenshotSaver.Outcome) -> Void) -> Void)? = nil,
+                usingPNG presentPNG: ((ScrollPNGFile, @escaping (ScreenshotSaver.Outcome) -> Void) -> Void)? = nil,
+                using present: ((CGImage, @escaping (ScreenshotSaver.Outcome) -> Void) -> Void)? = nil) {
         guard !closed, !state.finishing, !state.selectingRegion else { return }
-        if let readyImage { state.finishing = true; deliver(readyImage, saveAs: saveAs, using: present); return }
-        let includeLastFrame = !state.paused
+        let directSave = saveAs && presentPNG == nil && present == nil
+        if !directSave, let readyPNG { state.finishing = true; deliverPNG(readyPNG, saveAs: saveAs, using: presentPNG); return }
+        if !directSave, let readyImage { state.finishing = true; deliver(readyImage, saveAs: saveAs, using: present); return }
+        let includeLastFrame = !state.paused && !readyForSaving
         state.finishing = true; state.note = "正在生成长截图…"; sampling?.cancel()
         finishingTask = Task { [weak self] in
             guard let self else { return }
@@ -360,6 +388,19 @@ actor ScrollCaptureWorker {
                     if lastOutcome == .noOverlap { throw CompletionError.unmatched }
                 }
                 guard !closed else { return }
+                readyForSaving = true
+                if directSave {
+                    let large = await worker.prefersFileExport
+                    guard !closed, !Task.isCancelled else { return }
+                    presentSave(large: large, using: exportPresenter)
+                    return
+                }
+                if await worker.prefersFileExport {
+                    let file = try await worker.exportPNG(appearance: appearance, pixelsPerPoint: pixelsPerPoint)
+                    guard !Task.isCancelled, !closed else { return }
+                    readyPNG = file; deliverPNG(file, saveAs: saveAs, using: presentPNG)
+                    return
+                }
                 let image = try await worker.compose()
                 guard !Task.isCancelled, !closed else { return }
                 readyImage = image; deliver(image, saveAs: saveAs, using: present)
@@ -370,6 +411,66 @@ actor ScrollCaptureWorker {
                 state.onPause = nil
             }
         }
+    }
+    private func presentSave(large: Bool,
+                             using present: (([ScreenshotFileFormat], @escaping (URL) async throws -> Void, @escaping (ScreenshotSaver.Outcome) -> Void) -> Void)?) {
+        let formats: [ScreenshotFileFormat] = large ? [.png, .pdf] : [.png, .jpeg, .pdf]
+        let worker = self.worker, appearance = self.appearance, pixelsPerPoint = self.pixelsPerPoint
+        let writer: (URL) async throws -> Void = { url in
+            try await worker.save(to: url, appearance: appearance, pixelsPerPoint: pixelsPerPoint)
+        }
+        panel?.orderOut(nil); border?.orderOut(nil)
+        let handler: (ScreenshotSaver.Outcome) -> Void = { [weak self] outcome in
+            guard let self, !closed else { return }
+            switch outcome {
+            case .saved(let url): close(); onSaved(url)
+            case .cancelled, .failed:
+                state.finishing = false; state.paused = true
+                if case .failed(let reason) = outcome {
+                    state.warning = true; state.note = "保存失败：\(reason) · 可重试另存为"
+                } else {
+                    state.warning = false; state.note = "长图已保留，可另存为、复制或继续采集。"
+                }
+                border?.orderFrontRegardless(); panel?.orderFrontRegardless(); beginSampling()
+            }
+        }
+        if let present { present(formats, writer, handler) }
+        else {
+            saver.presentExport(formats: formats, onWriting: { [weak self] format in
+                guard let self, !closed else { return }
+                state.warning = false; state.note = format == .pdf ? "正在生成 PDF…" : "正在保存长截图…"
+                border?.orderFrontRegardless(); panel?.orderFrontRegardless()
+            }, writer: writer, completion: handler)
+        }
+    }
+    private func deliverPNG(_ file: ScrollPNGFile, saveAs: Bool,
+                            using present: ((ScrollPNGFile, @escaping (ScreenshotSaver.Outcome) -> Void) -> Void)?) {
+        guard saveAs else {
+            if onCopiedPNG?(file.url) == true { close() }
+            else {
+                state.finishing = false; state.paused = true; state.warning = true
+                state.note = "复制未完成，截图已保留。可以重试复制或另存为。"
+            }
+            return
+        }
+        panel?.orderOut(nil); border?.orderOut(nil)
+        let handler: (ScreenshotSaver.Outcome) -> Void = { [weak self] outcome in
+            guard let self, !closed else { return }
+            switch outcome {
+            case .saved(let url): close(); onSaved(url)
+            case .cancelled, .failed:
+                state.finishing = false; state.paused = true
+                if case .failed(let reason) = outcome {
+                    state.warning = true; state.note = "保存失败：\(reason) · 可重试另存为"
+                } else {
+                    state.warning = false; state.note = "长图已保留，可另存为、复制或继续采集。"
+                }
+                border?.orderFrontRegardless(); panel?.orderFrontRegardless()
+                beginSampling()
+            }
+        }
+        if let present { present(file, handler) }
+        else { saver.presentPNG(file, completion: handler) }
     }
     private func deliver(_ image: CGImage, saveAs: Bool,
                          using present: ((CGImage, @escaping (ScreenshotSaver.Outcome) -> Void) -> Void)?) {
@@ -411,6 +512,8 @@ actor ScrollCaptureWorker {
     func cancel() { guard !closed else { return }; close(); onComplete(nil) }
     private func close() {
         closed = true; sampling?.cancel(); finishingTask?.cancel(); regionTask?.cancel()
+        saver.cancel()
+        readyImage = nil; readyPNG = nil
         regionPicker?.orderOut(nil); regionPicker?.close(); regionPicker = nil
         panel?.orderOut(nil); panel?.close(); panel = nil
         border?.orderOut(nil); border?.close(); border = nil
@@ -447,12 +550,12 @@ private struct ScrollCaptureHUD: View {
                     .onAppear { proxy.scrollTo("latest", anchor: .bottom) }
                 }
             }
-            .background(Theme.background).clipShape(RoundedRectangle(cornerRadius: 6))
+            .background(Theme.background).clipped()
             .onHover { inspectingPreview = $0 }
             Text("\(state.width) × \(state.height) px")
                 .font(.system(size: 13, weight: .medium, design: .monospaced)).foregroundStyle(Theme.secondary)
-            if state.warning {
-                Text(state.note).font(.system(size: 12)).foregroundStyle(.orange)
+            if state.warning || state.finishing {
+                Text(state.note).font(.system(size: 12)).foregroundStyle(state.warning ? .orange : Theme.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
             HStack(spacing: 5) {

@@ -172,6 +172,7 @@ final class EditorModel: ObservableObject {
     @Published var recognizing = false
     var onPin: ((CGImage) -> Void)?
     var onExport: ((CGImage) -> Void)?
+    var onFileExport: ((URL) -> Void)?
     var imageSize: CGSize { CGSize(width: image.width, height: image.height) }
     var snapshot: EditorSnapshot { EditorSnapshot(image: image, marks: marks, captureSelection: captureSelection) }
 
@@ -257,11 +258,13 @@ final class EditorModel: ObservableObject {
         return true
     }
     private let screenshotSaver = ScreenshotSaver()
-    func save() {
+    @MainActor func save() {
         guard let result = rendered() else { return }
         screenshotSaver.present(result) { [weak self] outcome in
             switch outcome {
-            case .saved(let url): self?.onExport?(result); self?.message = "已保存：\(url.lastPathComponent)"
+            case .saved(let url):
+                if let export = self?.onFileExport { export(url) } else { self?.onExport?(result) }
+                self?.message = "已保存：\(url.lastPathComponent)"
             case .cancelled: break
             case .failed(let reason): self?.message = "保存失败：\(reason)"
             }
@@ -283,6 +286,11 @@ final class EditorModel: ObservableObject {
 }
 
 enum ClipboardImage {
+    static func writePNG(at url: URL, to pasteboard: NSPasteboard = .general) -> Bool {
+        guard let data = try? Data(contentsOf: url, options: .alwaysMapped) else { return false }
+        pasteboard.clearContents()
+        return pasteboard.setData(data, forType: .png)
+    }
     static func write(_ image: CGImage, to pasteboard: NSPasteboard = .general) -> Bool {
         guard let data = Raster.png(image) else { return false }
         pasteboard.clearContents()

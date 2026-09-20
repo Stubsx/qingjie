@@ -8,6 +8,8 @@ struct HistoryItem: Identifiable {
     let url: URL
     let date: Date
     let thumbnail: NSImage
+    var pageCount: Int? = nil
+    var isPDF: Bool { url.pathExtension.lowercased() == "pdf" }
 }
 
 enum HomePage: String, CaseIterable {
@@ -53,21 +55,32 @@ final class AppState: ObservableObject {
     }
     func reloadHistory() {
         let urls = (try? FileManager.default.contentsOfDirectory(at: historyDirectory, includingPropertiesForKeys: [.creationDateKey])) ?? []
-        history = urls.filter { $0.pathExtension == "png" }.sorted { $0.lastPathComponent > $1.lastPathComponent }.prefix(30).compactMap { url in
-            guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-                  let thumb = CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceThumbnailMaxPixelSize: 560] as CFDictionary) else { return nil }
+        history = urls.filter { ["png", "pdf"].contains($0.pathExtension) }.sorted { $0.lastPathComponent > $1.lastPathComponent }.prefix(30).compactMap { url in
+            let thumb: CGImage
+            var pageCount: Int?
+            if url.pathExtension == "pdf" {
+                guard let result = try? ScreenshotPDF.thumbnail(at: url) else { return nil }
+                thumb = result.image; pageCount = result.pages
+            } else {
+                guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+                      let result = CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceThumbnailMaxPixelSize: 560] as CFDictionary) else { return nil }
+                thumb = result
+            }
             let date = (try? url.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? Date()
-            return HistoryItem(url: url, date: date, thumbnail: NSImage(cgImage: thumb, size: .zero))
+            return HistoryItem(url: url, date: date, thumbnail: NSImage(cgImage: thumb, size: .zero), pageCount: pageCount)
         }
     }
     func remember(_ output: ScreenshotOutput) {
         switch output {
         case .copied(let image): remember(image)
+        case .copiedPNG(let url):
+            do { try rememberFile(url) }
+            catch { notice = "截图已复制，但最近记录保存失败：\(error.localizedDescription)" }
         case .saved(let url):
             do {
-                // Keep the actual exported PNG, including transparency and shadow.
-                if url.pathExtension.lowercased() == "png" {
-                    try rememberPNG(Data(contentsOf: url))
+                // Keep the complete exported document or PNG as the history item.
+                if ["png", "pdf"].contains(url.pathExtension.lowercased()) {
+                    try rememberFile(url)
                 } else {
                     guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
                           let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { throw CocoaError(.fileReadCorruptFile) }
@@ -90,7 +103,25 @@ final class AppState: ObservableObject {
         try data.write(to: historyDirectory.appendingPathComponent(filename), options: .atomic)
         lastDigest = digest
         let all = try FileManager.default.contentsOfDirectory(at: historyDirectory, includingPropertiesForKeys: nil)
-            .filter { $0.pathExtension == "png" }.sorted { $0.lastPathComponent > $1.lastPathComponent }
+            .filter { ["png", "pdf"].contains($0.pathExtension) }.sorted { $0.lastPathComponent > $1.lastPathComponent }
+        for old in all.dropFirst(30) { try FileManager.default.removeItem(at: old) }
+        reloadHistory()
+    }
+    private func rememberFile(_ source: URL) throws {
+        let handle = try FileHandle(forReadingFrom: source)
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        while let part = try handle.read(upToCount: 1024 * 1024), !part.isEmpty { hasher.update(data: part) }
+        let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        guard digest != lastDigest else { return }
+        try FileManager.default.createDirectory(at: historyDirectory, withIntermediateDirectories: true)
+        let formatter = DateFormatter(); formatter.dateFormat = "yyyyMMdd-HHmmss-SSS"
+        let suffix = source.pathExtension.lowercased() == "pdf" ? "pdf" : "png"
+        let target = historyDirectory.appendingPathComponent("\(formatter.string(from: Date()))-\(UUID().uuidString.prefix(6)).\(suffix)")
+        try ScreenshotSaver.copyFile(source, to: target)
+        lastDigest = digest
+        let all = try FileManager.default.contentsOfDirectory(at: historyDirectory, includingPropertiesForKeys: nil)
+            .filter { ["png", "pdf"].contains($0.pathExtension) }.sorted { $0.lastPathComponent > $1.lastPathComponent }
         for old in all.dropFirst(30) { try FileManager.default.removeItem(at: old) }
         reloadHistory()
     }

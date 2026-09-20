@@ -278,6 +278,12 @@ enum CaptureMode { case region, fullscreen }
         endCapture(completed: true)
         onExport?(.saved(url))
     }
+    private func finishCopyingPNG(_ url: URL) -> Bool {
+        guard ClipboardImage.writePNG(at: url) else { return false }
+        endCapture(completed: true)
+        onExport?(.copiedPNG(url))
+        return true
+    }
     private func endCapture(completed: Bool) {
         let cancelledSelection = recordingSelection
         recordingSelection = nil
@@ -342,6 +348,7 @@ enum CaptureMode { case region, fullscreen }
             guard selection.contains(local) else { return nil }
             return CaptureGeometry.imagePoint(local, displayedIn: selection, imageSize: CGSize(width: first.width, height: first.height))
         }, onSaved: { [weak self] in self?.finishSaving($0) },
+           onCopiedPNG: { [weak self] in self?.finishCopyingPNG($0) ?? false },
            onComplete: { [weak self] in self?.finish(image: $0) })
         beginScrolling(session, screen: screen, selection: selection)
     }
@@ -366,6 +373,7 @@ enum CaptureMode { case region, fullscreen }
                 }
                 return crop
             }, onSaved: { [weak self] in self?.finishSaving($0) },
+           onCopiedPNG: { [weak self] in self?.finishCopyingPNG($0) ?? false },
            onComplete: { [weak self] in self?.finish(image: $0) })
             session.state.onAdvance = { source.advance() }
             beginScrolling(session, screen: screen, selection: selection)
@@ -475,7 +483,7 @@ final class SelectionView: NSView {
         context.addPath(shade); context.setFillColor(NSColor.black.withAlphaComponent(0.46).cgColor); context.fillPath(using: .evenOdd)
         if let selection {
             context.setStrokeColor(NSColor(calibratedRed: 0.73, green: 0.94, blue: 0.62, alpha: 1).cgColor)
-            context.setLineWidth(1.5); context.stroke(selection)
+            context.setLineWidth(2.5); context.stroke(selection)
             for point in [CGPoint(x: selection.minX, y: selection.minY), CGPoint(x: selection.maxX, y: selection.minY), CGPoint(x: selection.minX, y: selection.maxY), CGPoint(x: selection.maxX, y: selection.maxY)] {
                 context.setFillColor(NSColor.white.cgColor); context.fillEllipse(in: CGRect(x: point.x - 3, y: point.y - 3, width: 6, height: 6))
             }

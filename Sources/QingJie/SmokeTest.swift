@@ -333,12 +333,15 @@ enum SmokeTest {
     @MainActor private static func checkSelectionToScrolling() throws {
         let base = DemoImage.make(), rect = CGRect(x: 30, y: 40, width: 280, height: 200)
         let crop = base.cropping(to: CGRect(x: 60, y: 80, width: 560, height: 400))!
-        var starts = 0
-        let inline = InlineCaptureView(screenshot: base, crop: crop, selection: rect, size: CGSize(width: 1000, height: 700), onStartScrolling: { _, _, _ in starts += 1 })
+        var starts = 0, scrollingImage: CGImage?
+        let inline = InlineCaptureView(screenshot: base, crop: crop, selection: rect, size: CGSize(width: 1000, height: 700),
+                                       appearance: .init(roundedCorners: true, shadow: true, cornerRadius: 48),
+                                       onStartScrolling: { _, _, image in starts += 1; scrollingImage = image })
         let clipboardChange = NSPasteboard.general.changeCount
         try require(starts == 0, "普通框选只显示工具栏，不自动启动长截图")
         inline.startScrolling()
         try require(starts == 1 && inline.selection == rect && inline.model.image === crop, "点击长截图使用原选区和原始像素，不重新框选")
+        try require(scrollingImage === crop, "开启圆角和阴影时长截图仍从未经美化的矩形原图开始")
         try require(NSPasteboard.general.changeCount == clipboardChange, "切换长截图不会提前复制到剪贴板")
         inline.model.add(Mark(tool: .rectangle, start: .zero, end: CGPoint(x: 50, y: 50), color: .red, width: 4))
         inline.startScrolling()
@@ -897,8 +900,60 @@ enum SmokeTest {
         try require(completed != nil && Raster.png(completed!) == Raster.png(recoveryFrame(offset: 600)), "上滑后点击完成直接输出已捕获内容，不要求用户回到末端")
     }
 
+    @MainActor private static func checkPDFExport() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("QingJie-PDF-check-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let image = DemoImage.makeLong(), pdf = root.appendingPathComponent("ordinary.pdf")
+        try ScreenshotSaver.write(image, to: pdf, appearance: .init(roundedCorners: true, shadow: true))
+        guard let document = CGPDFDocument(pdf as CFURL) else { throw Failure(description: "PDF 文档可重新打开") }
+        try require(document.numberOfPages >= 3, "普通长图另存为 PDF 自动分页")
+        let history = AppState(historyDirectory: root.appendingPathComponent("History"))
+        history.remember(.saved(pdf)); history.reloadHistory()
+        try require(history.history.count == 1 && history.history[0].isPDF
+                    && history.history[0].pageCount == document.numberOfPages, "最近记录保留完整 PDF、缩略图与页数")
+        let recorded = try Data(contentsOf: history.history[0].url), original = try Data(contentsOf: pdf)
+        try require(recorded == original, "PDF 最近记录逐字节保留原文档")
+        history.remember(.saved(pdf))
+        try require(history.history.count == 1, "同一 PDF 不重复写入最近记录")
+        let diskHistory = AppState(historyDirectory: root.appendingPathComponent("DiskHistory"))
+        var writer: ((URL) async throws -> Void)?, completion: ((ScreenshotSaver.Outcome) -> Void)?
+        var offered: [ScreenshotFileFormat] = [], copied = false
+        let session = try ScrollCaptureSession(first: image, memoryBudget: 0, captureFrame: { image },
+                                              onSaved: { diskHistory.remember(.saved($0)) }, onComplete: { _ in copied = true })
+        session.state.paused = true
+        let present: ([ScreenshotFileFormat], @escaping (URL) async throws -> Void, @escaping (ScreenshotSaver.Outcome) -> Void) -> Void = {
+            offered = $0; writer = $1; completion = $2
+        }
+        session.finish(saveAs: true, usingExport: present)
+        for _ in 0..<200 { if writer != nil { break }; try await Task.sleep(nanoseconds: 20_000_000) }
+        try require(writer != nil && offered == [.png, .pdf] && !copied, "超长截图直接选择 PNG 或自动分页 PDF")
+        completion?(.cancelled)
+        try require(!session.state.finishing && diskHistory.history.isEmpty, "取消 PDF 保存仍保留截图且不追加历史")
+        writer = nil; session.finish(saveAs: true, usingExport: present)
+        for _ in 0..<200 { if writer != nil { break }; try await Task.sleep(nanoseconds: 20_000_000) }
+        completion?(.failed("测试写入失败"))
+        try require(!session.state.finishing && diskHistory.history.isEmpty, "PDF 写入失败后可以重新选择格式和保存位置")
+        writer = nil; session.finish(saveAs: true, usingExport: present)
+        for _ in 0..<200 { if writer != nil { break }; try await Task.sleep(nanoseconds: 20_000_000) }
+        guard let writer else { throw Failure(description: "PDF 重试写入器就绪") }
+        let diskPDF = root.appendingPathComponent("disk.pdf")
+        try await writer(diskPDF); completion?(.saved(diskPDF))
+        try require(diskHistory.history.count == 1 && diskHistory.history[0].pageCount == document.numberOfPages && !copied,
+                    "磁盘分块直接导出 PDF，保存完成后写入完整历史")
+        let diskDocument = CGPDFDocument(diskPDF as CFURL)!
+        try require(diskDocument.numberOfPages == document.numberOfPages, "内存与磁盘导出 PDF 分页一致")
+        if let path = ProcessInfo.processInfo.environment["QINGJIE_PDF_QA_DIR"] {
+            let output = URL(fileURLWithPath: path, isDirectory: true)
+            try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
+            try ScreenshotSaver.copyFile(diskPDF, to: output.appendingPathComponent("long-capture.pdf"))
+            try Raster.png(image)!.write(to: output.appendingPathComponent("source.png"))
+        }
+    }
+
     @MainActor static func runWorkerChecks() async throws {
         try await checkScrollRecovery()
+        try await checkPDFExport()
         let historyRoot = FileManager.default.temporaryDirectory.appendingPathComponent("QingJie-long-history-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: historyRoot, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: historyRoot) }
@@ -932,21 +987,73 @@ enum SmokeTest {
         let saving = try ScrollCaptureSession(first: sourceImage, appearance: appearance, pixelsPerPoint: 2,
                                              captureFrame: { sourceImage }, onSaved: { savedHistory.remember(.saved($0)) }, onComplete: { _ in })
         saving.state.paused = true
-        saving.finish(saveAs: true) { _, callback in pendingSave = callback }
+        saving.finish(saveAs: true, using: { _, callback in pendingSave = callback })
         for _ in 0..<75 {
             if pendingSave != nil { break }
             try await Task.sleep(nanoseconds: 20_000_000)
         }
         try require(pendingSave != nil && savedHistory.history.isEmpty, "长截图保存面板等待期间不提前写入历史")
         pendingSave?(.cancelled)
-        saving.finish(saveAs: true) { _, callback in callback(.failed("测试写入失败")) }
+        saving.finish(saveAs: true, using: { _, callback in callback(.failed("测试写入失败")) })
         try require(savedHistory.history.isEmpty && !saving.state.finishing, "长截图取消保存及写入失败后仍可重试，不生成历史")
         let savedLong = historyRoot.appendingPathComponent("long.png")
         try ScreenshotSaver.write(sourceImage, to: savedLong, appearance: appearance, pixelsPerPoint: 2)
-        saving.finish(saveAs: true) { _, callback in callback(.saved(savedLong)) }
+        saving.finish(saveAs: true, using: { _, callback in callback(.saved(savedLong)) })
         let savedLongData = try Data(contentsOf: savedLong)
         let savedLongHistoryData = try savedHistory.history.first.map { try Data(contentsOf: $0.url) }
         try require(savedHistory.history.count == 1 && savedLongHistoryData == savedLongData, "长截图另存为重试成功只记录一次实际美化成品")
+        let diskHistory = AppState(historyDirectory: historyRoot.appendingPathComponent("DiskCopied"))
+        var copyAttempts = 0, preparedURL: URL?
+        let diskCopy = try ScrollCaptureSession(first: sourceImage, appearance: appearance, pixelsPerPoint: 2,
+                                               memoryBudget: 0, captureFrame: { sourceImage }, onCopiedPNG: { url in
+            copyAttempts += 1; preparedURL = url
+            guard copyAttempts > 1, ClipboardImage.writePNG(at: url, to: clipboard) else { return false }
+            diskHistory.remember(.copiedPNG(url)); return true
+        }, onComplete: { _ in })
+        diskCopy.state.paused = true; diskCopy.finish()
+        for _ in 0..<250 {
+            if copyAttempts > 0 { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        try require(copyAttempts == 1 && !diskCopy.state.finishing && preparedURL != nil
+                    && FileManager.default.fileExists(atPath: preparedURL!.path), "长图复制失败保留已生成文件供重试")
+        let preparedBytes = try Data(contentsOf: preparedURL!)
+        diskCopy.finish()
+        try require(copyAttempts == 2 && clipboard.data(forType: .png) == preparedBytes,
+                    "磁盘长图直接复制 PNG 且重试复用成品")
+        let diskHistoryData = try diskHistory.history.first.map { try Data(contentsOf: $0.url) }
+        try require(diskHistoryData == preparedBytes && !FileManager.default.fileExists(atPath: preparedURL!.path),
+                    "磁盘长图最近记录保留相同成品并在完成后清理临时成品")
+        let diskSavedHistory = AppState(historyDirectory: historyRoot.appendingPathComponent("DiskSaved"))
+        var diskSaveCallback: ((ScreenshotSaver.Outcome) -> Void)?
+        let diskSave = try ScrollCaptureSession(first: sourceImage, appearance: appearance, pixelsPerPoint: 2,
+                                               memoryBudget: 0, captureFrame: { sourceImage },
+                                               onSaved: { diskSavedHistory.remember(.saved($0)) }, onComplete: { _ in })
+        diskSave.state.paused = true
+        diskSave.finish(saveAs: true, usingPNG: { _, callback in diskSaveCallback = callback })
+        for _ in 0..<250 {
+            if diskSaveCallback != nil { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        try require(diskSaveCallback != nil && diskSavedHistory.history.isEmpty, "磁盘长图等待保存时不提前记录")
+        diskSaveCallback?(.cancelled)
+        diskSave.finish(saveAs: true, usingPNG: { _, callback in callback(.failed("测试写入失败")) })
+        try require(!diskSave.state.finishing && diskSavedHistory.history.isEmpty, "磁盘长图取消或保存失败可继续重试")
+        let streamedURL = historyRoot.appendingPathComponent("streamed.png")
+        diskSave.finish(saveAs: true, usingPNG: { file, callback in
+            do { try ScreenshotSaver.copyFile(file.url, to: streamedURL); callback(.saved(streamedURL)) }
+            catch { callback(.failed(error.localizedDescription)) }
+        })
+        let streamedBytes = try Data(contentsOf: streamedURL)
+        let streamedHistory = try diskSavedHistory.history.first.map { try Data(contentsOf: $0.url) }
+        try require(streamedHistory == streamedBytes && streamedBytes == preparedBytes,
+                    "长图分段导出在复制和保存时使用相同圆角阴影成品")
+        let previousFile = historyRoot.appendingPathComponent("existing.png")
+        try Data([1, 2, 3]).write(to: previousFile)
+        do { try ScreenshotSaver.copyFile(historyRoot.appendingPathComponent("missing.png"), to: previousFile) }
+        catch { /* Expected read failure. */ }
+        let previousBytes = try Data(contentsOf: previousFile)
+        try require(previousBytes == Data([1, 2, 3]), "长图复制失败不破坏原有目标文件")
         let source = DemoChromeScrollSource()
         let first = source.frame()
         let worker = try ScrollCaptureWorker(first: first)
