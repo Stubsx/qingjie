@@ -206,7 +206,7 @@ struct HomeView: View {
                     Button("体验长截图（无需屏幕权限）") { state.showScrollDemo?() }.buttonStyle(ActionButtonStyle())
                 }
                 VStack(alignment: .leading, spacing: 12) {
-                    Text("框选后点击选区工具栏的「长截图」，用触控板或滚轮缓慢向下滚动，新内容会自动拼接。到达末尾后点击「完成复制」或「另存为」。").font(.system(size: 12)).foregroundStyle(Theme.secondary).lineSpacing(4).fixedSize(horizontal: false, vertical: true)
+                    Text("框选后点击「长截图」，手动向下滚动或点击「自动滚动」即可拼接。到达末尾后点击「完成复制」或「另存为」，按 Esc 可退出。").font(.system(size: 12)).foregroundStyle(Theme.secondary).lineSpacing(4).fixedSize(horizontal: false, vertical: true)
                     ForEach(["重复画面、短暂上滑和底部回弹都会自动处理", "灰色区域实时预览长图和像素尺寸，鼠标移入可滚动回看", "页内有多个面板时，把鼠标停在要截取的正文上滚动"], id: \.self) { tip in
                         HStack(alignment: .top, spacing: 8) {
                             Circle().fill(Theme.green).frame(width: 4, height: 4).padding(.top, 5)

@@ -391,13 +391,20 @@ public final class VerticalStitcher {
         return .appended(shift)
     }
 
-    @discardableResult public func exportPDF(to url: URL, checkCancellation: () throws -> Void = {}) throws -> Int {
+    private func retainedHeight(_ height: Int?) throws -> Int {
+        let height = height ?? totalHeight
+        guard height > 0, height <= totalHeight else { throw StitchError.invalidRegion }
+        return height
+    }
+
+    @discardableResult public func exportPDF(to url: URL, height: Int? = nil, checkCancellation: () throws -> Void = {}) throws -> Int {
+        let height = try retainedHeight(height)
         try storage.trim()
         let all = strips + (footer.map { [$0] } ?? [])
         var offsets: [Int] = [], offset = 0
         for strip in all { offsets.append(offset); offset += strip.raster.height }
         guard offset == totalHeight else { throw StitchError.allocationFailed }
-        return try ScreenshotPDF.write(to: url, width: width, height: totalHeight, checkCancellation: checkCancellation) { context, rows in
+        return try ScreenshotPDF.write(to: url, width: width, height: height, checkCancellation: checkCancellation) { context, rows in
             var low = 0, high = all.count
             while low < high {
                 let middle = (low + high) / 2
@@ -418,10 +425,12 @@ public final class VerticalStitcher {
 
     /// Large exports never allocate a bitmap the size of the entire document.
     public func exportPNG(appearance: ScreenshotAppearance = .init(), pixelsPerPoint: CGFloat = 1,
+                          height: Int? = nil,
                           checkCancellation: () throws -> Void = {}) throws -> ScrollPNGFile {
+        let height = try retainedHeight(height)
         let directory = try storage.workspace()
         let padding = try appearance.padding(pixelsPerPoint: pixelsPerPoint)
-        let outputWidth = width + padding * 2, outputHeight = totalHeight + padding * 2
+        let outputWidth = width + padding * 2, outputHeight = height + padding * 2
         guard outputWidth > 0, outputWidth <= 0x1fffffff, outputHeight > 0, outputHeight <= Int(Int32.max),
               outputHeight <= Int.max / outputWidth / 4 else { throw StitchError.limitReached }
         try directory.checkSpace(for: min(outputHeight, 512) * outputWidth * 4)
@@ -450,9 +459,9 @@ public final class VerticalStitcher {
                 context.translateBy(x: 0, y: CGFloat(overlap - (outputHeight - top - rows)))
                 let contentTop = top - overlap - padding, contentBottom = top + rows + overlap - padding
                 while firstStrip < all.count && offsets[firstStrip] + all[firstStrip].raster.height <= contentTop { firstStrip += 1 }
-                try appearance.draw(in: context, imageSize: CGSize(width: width, height: totalHeight), pixelsPerPoint: pixelsPerPoint) { rect in
+                try appearance.draw(in: context, imageSize: CGSize(width: width, height: height), pixelsPerPoint: pixelsPerPoint) { rect in
                     var index = firstStrip
-                    while index < all.count && offsets[index] < contentBottom {
+                    while index < all.count && offsets[index] < min(height, contentBottom) {
                         try autoreleasepool {
                             let raster = all[index].raster, image = try raster.load()
                             context.draw(image, in: CGRect(x: rect.minX, y: rect.maxY - CGFloat(offsets[index] + raster.height),
@@ -471,17 +480,20 @@ public final class VerticalStitcher {
         return ScrollPNGFile(directory: directory, url: url)
     }
 
-    public func compose() throws -> CGImage {
+    /// Cropping is an export choice; all captured strips remain available for adjustment or resuming.
+    public func compose(height: Int? = nil) throws -> CGImage {
+        let height = try retainedHeight(height)
         guard let space = CGColorSpace(name: CGColorSpace.sRGB),
-              let context = CGContext(data: nil, width: width, height: totalHeight, bitsPerComponent: 8, bytesPerRow: 0,
+              let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
                                       space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { throw StitchError.allocationFailed }
         var offset = 0
         for strip in strips + (footer.map { [$0] } ?? []) {
+            if offset >= height { break }
             let part = try strip.raster.load()
-            context.draw(part, in: CGRect(x: 0, y: totalHeight - offset - part.height, width: width, height: part.height))
+            context.draw(part, in: CGRect(x: 0, y: height - offset - part.height, width: width, height: part.height))
             offset += part.height
         }
-        guard offset == totalHeight, let result = context.makeImage() else { throw StitchError.allocationFailed }
+        guard offset >= height, let result = context.makeImage() else { throw StitchError.allocationFailed }
         return result
     }
 

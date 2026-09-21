@@ -78,6 +78,20 @@ final class PDFExportTests: XCTestCase {
         XCTAssertTrue(stitcher.usesDiskCache); XCTAssertEqual(stitcher.residentImageBytes, 0)
         XCTAssertEqual(count, try ranges(source).count)
     }
+    func testBottomCropPDFContainsOnlyRetainedRows() throws {
+        let root = try root(); defer { try? FileManager.default.removeItem(at: root) }
+        let source = image(width: 512, height: 2400)
+        let stitcher = try VerticalStitcher(first: source, memoryBudget: 0)
+        let actual = root.appendingPathComponent("cropped.pdf"), expected = root.appendingPathComponent("expected.pdf")
+        XCTAssertEqual(try stitcher.exportPDF(to: actual, height: 500), 1)
+        try ScreenshotPDF.write(source.cropping(to: CGRect(x: 0, y: 0, width: 512, height: 500))!, to: expected)
+        let a = try ScreenshotPDF.thumbnail(at: actual), b = try ScreenshotPDF.thumbnail(at: expected)
+        XCTAssertEqual(a.image.dataProvider?.data as Data?, b.image.dataProvider?.data as Data?)
+        let before = try Data(contentsOf: actual)
+        XCTAssertThrowsError(try stitcher.exportPDF(to: actual, height: 0))
+        XCTAssertEqual(try Data(contentsOf: actual), before)
+        XCTAssertEqual(stitcher.totalHeight, 2400); XCTAssertEqual(stitcher.residentImageBytes, 0)
+    }
     func testVeryLongPDFUsesSmallBandsAndKeepsEveryPage() throws {
         let root = try root(); defer { try? FileManager.default.removeItem(at: root) }
         let url = root.appendingPathComponent("long.pdf"), width = 1200, height = 100_000

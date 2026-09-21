@@ -58,20 +58,20 @@ actor ScrollCaptureWorker {
                      preview: includePreview ? try preview() : nil)
     }
     func resetStability() { lastSample = nil; stableSince = nil }
-    func compose() throws -> CGImage { try stitcher.compose() }
+    func compose(height: Int? = nil) throws -> CGImage { try stitcher.compose(height: height) }
     var prefersFileExport: Bool { stitcher.prefersFileExport }
-    func exportPNG(appearance: ScreenshotAppearance, pixelsPerPoint: CGFloat) throws -> ScrollPNGFile {
-        try stitcher.exportPNG(appearance: appearance, pixelsPerPoint: pixelsPerPoint) { try Task.checkCancellation() }
+    func exportPNG(appearance: ScreenshotAppearance, pixelsPerPoint: CGFloat, height: Int? = nil) throws -> ScrollPNGFile {
+        try stitcher.exportPNG(appearance: appearance, pixelsPerPoint: pixelsPerPoint, height: height) { try Task.checkCancellation() }
     }
-    func save(to url: URL, appearance: ScreenshotAppearance, pixelsPerPoint: CGFloat) throws {
+    func save(to url: URL, appearance: ScreenshotAppearance, pixelsPerPoint: CGFloat, height: Int? = nil) throws {
         try Task.checkCancellation()
         switch ScreenshotFileFormat.forURL(url) {
-        case .pdf: try stitcher.exportPDF(to: url) { try Task.checkCancellation() }
+        case .pdf: try stitcher.exportPDF(to: url, height: height) { try Task.checkCancellation() }
         case .png:
-            let file = try exportPNG(appearance: appearance, pixelsPerPoint: pixelsPerPoint)
+            let file = try exportPNG(appearance: appearance, pixelsPerPoint: pixelsPerPoint, height: height)
             try Task.checkCancellation(); try ScreenshotSaver.copyFile(file.url, to: url)
         case .jpeg:
-            try ScreenshotSaver.write(stitcher.compose(), to: url)
+            try ScreenshotSaver.write(stitcher.compose(height: height), to: url)
         }
     }
     func preview() throws -> CGImage { try stitcher.preview(maximumHeight: 4096, maximumWidth: 640) }
@@ -81,22 +81,31 @@ actor ScrollCaptureWorker {
     @Published var count = 1
     @Published var height: Int
     @Published var paused = false
+    @Published var autoScrolling = false
+    @Published var autoScrollNote: String?
     @Published var finishing = false
     @Published var atLimit = false
     @Published var warning = false
     @Published var note = "轻轻向下滚动，自动识别内容区并累计长图。"
     @Published var selectingRegion = false
+    @Published var preparingCrop = false
+    @Published var cropping = false
+    @Published var cropHeight: Int?
+    var outputHeight: Int { cropHeight ?? height }
     @Published var layoutNote = "图像识别已就绪 · 自动区分正文与固定区域"
     @Published var manualRegion = false
     @Published var preview: NSImage?
     @Published var width: Int
     let isDemo: Bool
     var onPause: (() -> Void)?
+    var onAutoScroll: (() -> Void)?
     var onFinish: (() -> Void)?
     var onSave: (() -> Void)?
     var onCancel: (() -> Void)?
     var onAdvance: (() -> Void)?
     var onSelectRegion: (() -> Void)?
+    var onCrop: (() -> Void)?
+    var onCropChange: ((Int) -> Void)?
     init(first: CGImage, isDemo: Bool) { width = first.width; height = first.height; self.isDemo = isDemo }
 }
 
@@ -115,12 +124,19 @@ actor ScrollCaptureWorker {
     private var readyForSaving = false
     private var sampling: Task<Void, Never>?
     private var finishingTask: Task<Void, Never>?
-    private var panel: NSPanel?
+    private var panel: ScrollCapturePanel?
     private var previewMaximumFrame: CGRect?
     private var border: NSPanel?
     private var closed = false
+    private var escapeMonitor: ScrollEscapeMonitor?
+    private var autoAdvance: ScrollAutoAdvance?
+    private var automaticFocus: CGPoint?
+    private var scrollingRegion: CGRect
+    private var scrollDestination: ScrollCaptureDestination?
+    private var scrollActivationDeadline: TimeInterval?
     private var regionPicker: NSWindow?
     private var regionTask: Task<Void, Never>?
+    private var cropTask: Task<Void, Never>?
     private var screen: NSScreen?
     private var captureOutline: CGRect?
     private let sourceSize: CGSize
@@ -134,24 +150,30 @@ actor ScrollCaptureWorker {
          onCopiedPNG: ((URL) -> Bool)? = nil,
          onComplete: @escaping (CGImage?) -> Void) throws {
         sourceSize = CGSize(width: first.width, height: first.height)
+        scrollingRegion = CGRect(origin: .zero, size: sourceSize)
         self.appearance = appearance; self.pixelsPerPoint = pixelsPerPoint
         state = ScrollCaptureState(first: first, isDemo: isDemo)
         worker = try ScrollCaptureWorker(first: first, memoryBudget: memoryBudget)
         self.captureFrame = captureFrame; self.captureFocus = captureFocus; self.onComplete = onComplete; self.onSaved = onSaved
         self.onCopiedPNG = onCopiedPNG
         state.onPause = { [weak self] in self?.togglePause() }
+        state.onAutoScroll = { [weak self] in self?.toggleAutoScroll() }
         state.onFinish = { [weak self] in self?.finish() }
         state.onSave = { [weak self] in self?.finish(saveAs: true) }
         state.onCancel = { [weak self] in self?.cancel() }
         state.onSelectRegion = { [weak self] in self?.selectContentRegion() }
+        state.onCrop = { [weak self] in self?.toggleCrop() }
+        state.onCropChange = { [weak self] in self?.setCropHeight($0) }
     }
 
     /// Offscreen rendering for local visual verification without accessing the user's screen.
-    static func renderHUDPreview(first: CGImage, preview: CGImage? = nil) -> CGImage? {
+    static func renderHUDPreview(first: CGImage, preview: CGImage? = nil, cropHeight: Int? = nil) -> CGImage? {
         let state = ScrollCaptureState(first: first, isDemo: true)
         state.preview = NSImage(cgImage: preview ?? first, size: .zero)
+        state.onPause = {}; state.onAutoScroll = {}
+        state.cropping = cropHeight != nil; state.cropHeight = cropHeight; state.paused = state.cropping
         let view = NSHostingView(rootView: ScrollCaptureHUD(state: state))
-        let height = min(680, 152 + ceil(292 * CGFloat(first.height) / CGFloat(first.width)))
+        let height = min(680, 176 + ceil(292 * CGFloat(first.height) / CGFloat(first.width)))
         let window = NSWindow(contentRect: CGRect(x: 0, y: 0, width: 320, height: height), styleMask: [.borderless], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false; window.contentView = view
         view.layoutSubtreeIfNeeded()
@@ -163,13 +185,19 @@ actor ScrollCaptureWorker {
 
     func start(screen: NSScreen, selection: CGRect?) {
         self.screen = screen
+        escapeMonitor = ScrollEscapeMonitor { [weak self] in self?.cancel() }
+        escapeMonitor?.start()
         let visible = CGRect(x: 0, y: screen.frame.maxY - screen.visibleFrame.maxY,
                              width: screen.visibleFrame.width, height: screen.visibleFrame.height)
             .offsetBy(dx: screen.visibleFrame.minX - screen.frame.minX, dy: 0)
         let localSelection = selection ?? CGRect(origin: .zero, size: screen.frame.size)
+        captureOutline = CGRect(x: screen.frame.minX + localSelection.minX, y: screen.frame.maxY - localSelection.maxY,
+                                width: localSelection.width, height: localSelection.height)
         let previewFrame = InteractionGeometry.scrollPreviewFrame(selection: localSelection, bounds: visible)
         let size = previewFrame.size
-        let hud = NSPanel(contentRect: CGRect(origin: .zero, size: size), styleMask: [.titled, .nonactivatingPanel, .fullSizeContentView], backing: .buffered, defer: false)
+        let hud = ScrollCapturePanel(contentRect: CGRect(origin: .zero, size: size), styleMask: [.titled, .nonactivatingPanel, .fullSizeContentView], backing: .buffered, defer: false)
+        hud.permitsKeyboardFocus = { [weak self] in self?.state.isDemo == true || self?.state.cropping == true }
+        hud.becomesKeyOnlyIfNeeded = true
         hud.title = state.isDemo ? "轻截 · 长截图演示" : "轻截 · 滚动长截图"
         hud.titleVisibility = .hidden; hud.titlebarAppearsTransparent = true
         hud.isOpaque = false; hud.backgroundColor = .clear
@@ -202,15 +230,17 @@ actor ScrollCaptureWorker {
             guard let self else { return }
             if let preview = try? await worker.preview() { state.preview = NSImage(cgImage: preview, size: .zero) }
             while !Task.isCancelled && !closed {
-                if !state.paused && !state.finishing {
+                if !state.paused && !state.finishing && canSampleAutomaticScroll() {
                     do {
                         let image = try await captureFrame()
                         guard !Task.isCancelled, !closed else { return }
                         let update = try await worker.observe(image, focusPoint: currentFocus())
                         guard !Task.isCancelled, !closed else { return }
                         apply(update)
+                        advanceAutomatically(after: update)
                     } catch {
                         guard !Task.isCancelled, !closed else { return }
+                        stopAutoScroll()
                         state.paused = true; state.warning = true
                         state.note = "捕获暂停：\(error.localizedDescription) 可完成已捕获部分。"
                     }
@@ -221,11 +251,13 @@ actor ScrollCaptureWorker {
     }
 
     private func currentFocus() -> CGPoint? {
+        if state.autoScrolling { return automaticFocus }
         if panel?.frame.contains(NSEvent.mouseLocation) != true, let point = captureFocus() { lastFocus = point }
         return lastFocus
     }
 
     private func apply(_ update: ScrollUpdate) {
+        scrollingRegion = update.region
         state.count = update.count; state.height = update.height; state.width = update.width
         if update.layoutLocked || state.manualRegion {
             state.layoutNote = state.manualRegion ? "手动内容区 · 只拼接框选范围" : (update.motionRecognized ? "已锁定滚动面板 · 独立变化的侧栏已排除" : "已自动锁定内容区 · 固定区域不重复拼接")
@@ -256,6 +288,7 @@ actor ScrollCaptureWorker {
             state.warning = update.count > 1
             state.note = update.count == 1 ? "尚未识别到连续滚动，请在正文缓慢滚动；若已跳过一大段，请回滚一些。" : "未找到可靠衔接。请回滚一点，再缓慢向下滚动。"
         case .limitReached:
+            stopAutoScroll()
             state.atLimit = true; state.paused = true; state.warning = true
             state.note = StitchError.limitReached.localizedDescription
         case nil: break
@@ -266,7 +299,7 @@ actor ScrollCaptureWorker {
     private func resizePreview() {
         guard let panel, let maximum = previewMaximumFrame else { return }
         let imageHeight = ceil((maximum.width - 28) * CGFloat(state.height) / CGFloat(max(1, state.width)))
-        let controls: CGFloat = 152 + (state.warning ? 78 : 0)
+        let controls: CGFloat = 176 + (state.warning ? 78 : 0)
         let height = min(maximum.height, max(260, imageHeight + controls))
         // Grow downward from the same top edge as the image becomes longer.
         let visible = screen?.visibleFrame ?? maximum
@@ -277,16 +310,156 @@ actor ScrollCaptureWorker {
     }
 
     private func togglePause() {
-        guard !state.finishing, !state.atLimit, !state.selectingRegion else { return }
+        guard !closed, !state.finishing, !state.atLimit, !state.selectingRegion, !state.preparingCrop else { return }
+        stopAutoScroll()
         state.paused.toggle(); state.warning = false
-        if !state.paused { readyImage = nil; readyPNG = nil; readyForSaving = false }
+        if !state.paused {
+            readyImage = nil; readyPNG = nil; readyForSaving = false
+            state.cropping = false; state.cropHeight = nil
+            beginSampling()
+        }
         state.note = state.paused ? "已暂停。恢复前请回到最后捕获的位置。" : "已继续，请缓慢向下滚动。"
         Task { await worker.resetStability() }
     }
 
+    private func toggleAutoScroll() {
+        guard !closed, !state.finishing, !state.atLimit, !state.selectingRegion, !state.preparingCrop,
+              !state.cropping, state.onPause != nil else { return }
+        if state.autoScrolling {
+            stopAutoScroll(note: "已停止自动滚动，可手动继续。")
+            return
+        }
+        if !state.isDemo, !ScrollCaptureInput.requestAccess() {
+            state.warning = true
+            state.note = "自动滚动需要辅助功能权限，授权后可重试；也可手动滚动。"
+            resizePreview(); return
+        }
+        automaticFocus = currentFocus()
+        if !state.isDemo {
+            guard let point = automaticScrollTarget(), let destination = ScrollCaptureInput.destination(at: point) else {
+                state.warning = true; state.note = "未找到可滚动的窗口，请将预览移出正文后重试。"
+                resizePreview(); return
+            }
+            scrollDestination = destination
+            // Activation is asynchronous. Do not classify the toolbar click as an app switch.
+            scrollActivationDeadline = ProcessInfo.processInfo.systemUptime + 1.5
+            panel?.resignKey()
+            ScrollCaptureInput.restoreFocus(to: destination)
+        }
+        readyImage = nil; readyPNG = nil; readyForSaving = false
+        state.paused = false; state.warning = false; state.autoScrollNote = nil
+        autoAdvance = ScrollAutoAdvance(); state.autoScrolling = true
+        if sampling == nil || sampling?.isCancelled == true { beginSampling() }
+    }
+
+    private func stopAutoScroll(note: String? = nil) {
+        autoAdvance = nil; state.autoScrolling = false; state.autoScrollNote = note
+        scrollDestination = nil; scrollActivationDeadline = nil
+    }
+
+    private func canSampleAutomaticScroll() -> Bool {
+        guard state.autoScrolling, !state.isDemo else { return true }
+        guard let destination = scrollDestination else { return false }
+        if NSWorkspace.shared.frontmostApplication?.processIdentifier == destination.processID {
+            scrollActivationDeadline = nil
+            return true
+        }
+        if let deadline = scrollActivationDeadline, ProcessInfo.processInfo.systemUptime < deadline { return false }
+        let restoring = scrollActivationDeadline != nil
+        stopAutoScroll(note: restoring ? "未能回到截图窗口，请激活窗口后重试。" : "已切换应用，自动滚动已停止。")
+        state.paused = true
+        return false
+    }
+
+    private func advanceAutomatically(after update: ScrollUpdate) {
+        guard !closed, !state.paused, !state.finishing, state.autoScrolling else { return }
+        let decision = autoAdvance?.observe(update.outcome, height: update.height, now: ProcessInfo.processInfo.systemUptime)
+        switch decision {
+        case .advance:
+            if state.isDemo { state.onAdvance?(); return }
+            guard canSampleAutomaticScroll(), let destination = scrollDestination else { return }
+            guard let point = automaticScrollTarget(), ScrollCaptureInput.destination(at: point) == destination else {
+                stopAutoScroll(note: "截图窗口已移动或被遮挡，自动滚动已停止。")
+                state.paused = true; return
+            }
+            guard ScrollCaptureInput.scroll(to: destination, at: point,
+                                          points: min(120, max(12, scrollingRegion.height / pixelsPerPoint * 0.18))) else {
+                stopAutoScroll()
+                state.warning = true; state.note = "无法自动滚动，请将预览移出正文并检查辅助功能权限。"
+                resizePreview(); return
+            }
+        case .stopped:
+            stopAutoScroll(note: "画面不再变化，自动滚动已停止。")
+        case .lostOverlap:
+            stopAutoScroll(note: "自动滚动已停止，请手动调整位置。")
+        case .wait, nil: break
+        }
+    }
+
+    private func automaticScrollTarget() -> CGPoint? {
+        guard let screen, let outline = captureOutline,
+              let display = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID else { return nil }
+        let region = scrollingRegion.insetBy(dx: 4, dy: 4)
+        // Prefer the panel under the pointer before the user clicked the HUD.
+        var candidates = [automaticFocus].compactMap { $0 }.filter { region.contains($0) }
+        for x in [CGFloat(0.5), 0.25, 0.75] {
+            for y in [CGFloat(0.5), 0.75, 0.25] {
+                candidates.append(CGPoint(x: region.minX + region.width * x, y: region.minY + region.height * y))
+            }
+        }
+        for point in candidates {
+            let desktop = CGPoint(x: outline.minX + point.x / sourceSize.width * outline.width,
+                                  y: outline.maxY - point.y / sourceSize.height * outline.height)
+            guard panel?.frame.contains(desktop) != true else { continue }
+            automaticFocus = point
+            let displayBounds = CGDisplayBounds(display)
+            return CGPoint(x: displayBounds.minX + desktop.x - screen.frame.minX,
+                           y: displayBounds.minY + screen.frame.maxY - desktop.y)
+        }
+        return nil
+    }
+
+    private func toggleCrop() {
+        guard !closed, !state.finishing, !state.selectingRegion, !state.preparingCrop else { return }
+        stopAutoScroll()
+        readyImage = nil; readyPNG = nil; readyForSaving = false
+        state.warning = false
+        if state.cropping {
+            state.cropping = false; state.cropHeight = nil
+            state.note = "已取消裁剪，可复制或继续采集。"
+            return
+        }
+        state.paused = true; state.preparingCrop = true; sampling?.cancel()
+        cropTask = Task { [weak self] in
+            guard let self else { return }
+            await sampling?.value
+            do {
+                // Include an already accepted in-flight match, then freeze the preview.
+                let latest = try await worker.snapshot()
+                guard !closed, !Task.isCancelled else { return }
+                apply(latest)
+                state.cropHeight = state.height; state.cropping = true
+                state.note = "拖动预览下边框，确定保留的位置。"
+            } catch {
+                state.warning = true; state.note = "无法打开裁剪：\(error.localizedDescription)"
+            }
+            state.preparingCrop = false
+        }
+    }
+
+    private func setCropHeight(_ height: Int) {
+        guard state.cropping, !state.finishing, !state.preparingCrop, !closed else { return }
+        let height = min(state.height, max(1, height))
+        guard height != state.cropHeight else { return }
+        state.cropHeight = height
+        readyImage = nil; readyPNG = nil; readyForSaving = false
+    }
+
     private func selectContentRegion() {
-        guard !closed, !state.finishing, !state.selectingRegion, state.count == 1, let screen else { return }
+        guard !closed, !state.finishing, !state.selectingRegion, !state.preparingCrop, !state.cropping,
+              state.count == 1, let screen else { return }
         let wasPaused = state.paused
+        stopAutoScroll()
         state.selectingRegion = true; state.paused = true; sampling?.cancel()
         regionTask = Task { [weak self] in
             guard let self else { return }
@@ -308,7 +481,7 @@ actor ScrollCaptureWorker {
                 let size = CGSize(width: CGFloat(first.width) * scale, height: CGFloat(first.height) * scale)
                 let picker = CaptureOverlayWindow(contentRect: CGRect(origin: .zero, size: size),
                                                   styleMask: [.titled], backing: .buffered, defer: false)
-                picker.title = "框选需要滚动的内容 · 松开应用 · Esc 取消框选"
+                picker.title = "框选需要滚动的内容 · 松开应用 · Esc 退出长截图"
                 picker.isReleasedWhenClosed = false; picker.level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 2)
                 picker.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
                 let view = SelectionView(image: first, size: size)
@@ -362,11 +535,13 @@ actor ScrollCaptureWorker {
                 usingExport exportPresenter: (([ScreenshotFileFormat], @escaping (URL) async throws -> Void, @escaping (ScreenshotSaver.Outcome) -> Void) -> Void)? = nil,
                 usingPNG presentPNG: ((ScrollPNGFile, @escaping (ScreenshotSaver.Outcome) -> Void) -> Void)? = nil,
                 using present: ((CGImage, @escaping (ScreenshotSaver.Outcome) -> Void) -> Void)? = nil) {
-        guard !closed, !state.finishing, !state.selectingRegion else { return }
+        guard !closed, !state.finishing, !state.selectingRegion, !state.preparingCrop else { return }
+        stopAutoScroll()
         let directSave = saveAs && presentPNG == nil && present == nil
         if !directSave, let readyPNG { state.finishing = true; deliverPNG(readyPNG, saveAs: saveAs, using: presentPNG); return }
         if !directSave, let readyImage { state.finishing = true; deliver(readyImage, saveAs: saveAs, using: present); return }
         let includeLastFrame = !state.paused && !readyForSaving
+        let cropHeight = state.cropHeight
         state.finishing = true; state.note = "正在生成长截图…"; sampling?.cancel()
         finishingTask = Task { [weak self] in
             guard let self else { return }
@@ -396,12 +571,12 @@ actor ScrollCaptureWorker {
                     return
                 }
                 if await worker.prefersFileExport {
-                    let file = try await worker.exportPNG(appearance: appearance, pixelsPerPoint: pixelsPerPoint)
+                    let file = try await worker.exportPNG(appearance: appearance, pixelsPerPoint: pixelsPerPoint, height: cropHeight)
                     guard !Task.isCancelled, !closed else { return }
                     readyPNG = file; deliverPNG(file, saveAs: saveAs, using: presentPNG)
                     return
                 }
-                let image = try await worker.compose()
+                let image = try await worker.compose(height: cropHeight)
                 guard !Task.isCancelled, !closed else { return }
                 readyImage = image; deliver(image, saveAs: saveAs, using: present)
             } catch {
@@ -416,12 +591,15 @@ actor ScrollCaptureWorker {
                              using present: (([ScreenshotFileFormat], @escaping (URL) async throws -> Void, @escaping (ScreenshotSaver.Outcome) -> Void) -> Void)?) {
         let formats: [ScreenshotFileFormat] = large ? [.png, .pdf] : [.png, .jpeg, .pdf]
         let worker = self.worker, appearance = self.appearance, pixelsPerPoint = self.pixelsPerPoint
+        let cropHeight = state.cropHeight
         let writer: (URL) async throws -> Void = { url in
-            try await worker.save(to: url, appearance: appearance, pixelsPerPoint: pixelsPerPoint)
+            try await worker.save(to: url, appearance: appearance, pixelsPerPoint: pixelsPerPoint, height: cropHeight)
         }
         panel?.orderOut(nil); border?.orderOut(nil)
+        escapeMonitor?.stop()
         let handler: (ScreenshotSaver.Outcome) -> Void = { [weak self] outcome in
             guard let self, !closed else { return }
+            escapeMonitor?.start()
             switch outcome {
             case .saved(let url): close(); onSaved(url)
             case .cancelled, .failed:
@@ -438,6 +616,7 @@ actor ScrollCaptureWorker {
         else {
             saver.presentExport(formats: formats, onWriting: { [weak self] format in
                 guard let self, !closed else { return }
+                escapeMonitor?.start()
                 state.warning = false; state.note = format == .pdf ? "正在生成 PDF…" : "正在保存长截图…"
                 border?.orderFrontRegardless(); panel?.orderFrontRegardless()
             }, writer: writer, completion: handler)
@@ -454,8 +633,10 @@ actor ScrollCaptureWorker {
             return
         }
         panel?.orderOut(nil); border?.orderOut(nil)
+        escapeMonitor?.stop()
         let handler: (ScreenshotSaver.Outcome) -> Void = { [weak self] outcome in
             guard let self, !closed else { return }
+            escapeMonitor?.start()
             switch outcome {
             case .saved(let url): close(); onSaved(url)
             case .cancelled, .failed:
@@ -485,8 +666,10 @@ actor ScrollCaptureWorker {
             return
         }
         panel?.orderOut(nil); border?.orderOut(nil)
+        escapeMonitor?.stop()
         let handler: (ScreenshotSaver.Outcome) -> Void = { [weak self] outcome in
             guard let self, !closed else { return }
+            escapeMonitor?.start()
             switch outcome {
             case .saved(let url): close(); onSaved(url)
             case .cancelled, .failed:
@@ -511,7 +694,8 @@ actor ScrollCaptureWorker {
     }
     func cancel() { guard !closed else { return }; close(); onComplete(nil) }
     private func close() {
-        closed = true; sampling?.cancel(); finishingTask?.cancel(); regionTask?.cancel()
+        closed = true; sampling?.cancel(); finishingTask?.cancel(); regionTask?.cancel(); cropTask?.cancel()
+        stopAutoScroll(); escapeMonitor?.stop(); escapeMonitor = nil
         saver.cancel()
         readyImage = nil; readyPNG = nil
         regionPicker?.orderOut(nil); regionPicker?.close(); regionPicker = nil
@@ -523,15 +707,26 @@ actor ScrollCaptureWorker {
 private struct ScrollCaptureHUD: View {
     @ObservedObject var state: ScrollCaptureState
     @State private var inspectingPreview = false
+    @State private var hoveredAction: Action?
+    private enum Action { case advance, autoScroll, pause, crop, cancel, save, copy }
     var body: some View {
         VStack(spacing: 12) {
             HStack {
                 Text(state.isDemo ? "长截图演示" : "长截图").font(.system(size: 14, weight: .semibold))
                 Spacer()
                 if state.finishing { Text("正在完成…").font(.system(size: 12)).foregroundStyle(Theme.secondary) }
+                else if state.preparingCrop { Text("正在准备…").font(.system(size: 12)).foregroundStyle(Theme.secondary) }
+                else if state.cropping { Text("裁剪中").font(.system(size: 12)).foregroundStyle(Theme.secondary) }
                 else if state.paused { Text("已暂停").font(.system(size: 12)).foregroundStyle(Theme.secondary) }
+                else if state.autoScrolling { Text("自动滚动中").font(.system(size: 12)).foregroundStyle(Theme.secondary) }
+                else { Text("Esc 退出").font(.system(size: 11)).foregroundStyle(Theme.secondary) }
             }
             GeometryReader { geometry in
+                if state.cropping, let image = state.preview {
+                    ScrollCropPreview(image: image, sourceSize: CGSize(width: state.width, height: state.height),
+                                      height: state.outputHeight, enabled: !state.finishing,
+                                      onChange: { state.onCropChange?($0) }, onCancel: { state.onCancel?() })
+                } else {
                 ScrollViewReader { proxy in
                     ScrollView(.vertical) {
                         VStack(spacing: 0) {
@@ -549,32 +744,72 @@ private struct ScrollCaptureHUD: View {
                     }
                     .onAppear { proxy.scrollTo("latest", anchor: .bottom) }
                 }
+                }
             }
             .background(Theme.background).clipped()
             .onHover { inspectingPreview = $0 }
-            Text("\(state.width) × \(state.height) px")
-                .font(.system(size: 13, weight: .medium, design: .monospaced)).foregroundStyle(Theme.secondary)
+            VStack(spacing: 4) {
+                Text("\(state.width) × \(state.outputHeight) px")
+                    .font(.system(size: 13, weight: .medium, design: .monospaced)).foregroundStyle(Theme.secondary)
+                Text(hoveredAction.map(help) ?? state.autoScrollNote ?? (state.cropping ? "拖动下边框，保留上方内容" : "悬停图标查看说明"))
+                    .font(.system(size: 11)).foregroundStyle(Theme.secondary)
+                    .multilineTextAlignment(.center).lineLimit(2)
+                    .frame(maxWidth: .infinity, minHeight: 30, maxHeight: 30)
+            }
             if state.warning || state.finishing {
                 Text(state.note).font(.system(size: 12)).foregroundStyle(state.warning ? .orange : Theme.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            HStack(spacing: 5) {
+            GeometryReader { geometry in
+                let count: CGFloat = state.isDemo ? 7 : 6
+                let target = min(36, (geometry.size.width - 3 * (count - 1)) / count)
+                HStack(spacing: 3) {
                 Spacer(minLength: 0)
                 if state.isDemo {
-                    CaptureIconButton(kind: .advance, title: "示例向下滚动") { state.onAdvance?() }
-                        .disabled(state.paused || state.finishing || state.selectingRegion)
+                    button(.advance, kind: .advance, title: "示例向下滚动", target: target,
+                           disabled: state.paused || state.finishing || state.selectingRegion || state.preparingCrop) { state.onAdvance?() }
                 }
-                CaptureIconButton(kind: state.paused ? .resume : .pause, title: state.paused ? "继续长截图" : "暂停长截图") { state.onPause?() }
-                    .disabled(state.finishing || state.atLimit || state.onPause == nil || state.selectingRegion)
-                CaptureIconButton(kind: .close, title: "取消长截图") { state.onCancel?() }
-                CaptureIconButton(kind: .save, title: "另存为") { state.onSave?() }
-                    .disabled(state.finishing || state.selectingRegion)
-                CaptureIconButton(kind: .copy, title: "完成复制", help: "完成并复制到剪贴板", primary: true) { state.onFinish?() }
-                    .disabled(state.finishing || state.selectingRegion)
-            }
+                button(.autoScroll, kind: .autoScroll, title: state.autoScrolling ? "停止自动滚动" : "自动滚动", target: target,
+                       selected: state.autoScrolling,
+                       disabled: state.finishing || state.atLimit || state.selectingRegion || state.preparingCrop || state.cropping || state.onPause == nil) { state.onAutoScroll?() }
+                button(.pause, kind: state.paused ? .resume : .pause, title: state.paused ? "继续长截图" : "暂停长截图", target: target,
+                       disabled: state.finishing || state.atLimit || state.onPause == nil || state.selectingRegion || state.preparingCrop) { state.onPause?() }
+                button(.crop, kind: .tool(.crop), title: state.cropping ? "取消裁剪" : "裁剪", target: target, selected: state.cropping,
+                       disabled: state.finishing || state.selectingRegion || state.preparingCrop) { state.onCrop?() }
+                button(.cancel, kind: .close, title: "取消长截图", target: target) { state.onCancel?() }
+                button(.save, kind: .save, title: "另存为", target: target,
+                       disabled: state.finishing || state.selectingRegion || state.preparingCrop) { state.onSave?() }
+                button(.copy, kind: .copy, title: "完成复制", target: target, primary: true,
+                       disabled: state.finishing || state.selectingRegion || state.preparingCrop) { state.onFinish?() }
+                Spacer(minLength: 0)
+                }
+            }.frame(height: 36)
         }.padding(14).frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(.white, in: RoundedRectangle(cornerRadius: 12))
             .foregroundStyle(Theme.green).preferredColorScheme(.light)
+    }
+
+    private func help(_ action: Action) -> String {
+        switch action {
+        case .advance: return "示例向下滚动 · 只推进一段演示内容"
+        case .autoScroll: return state.autoScrolling ? "停止自动滚动 · 停止后可手动继续" : "自动滚动 · 自动向下滚动并拼接长图"
+        case .pause: return state.paused ? "继续长截图 · 恢复手动滚动采集" : "暂停长截图 · 暂停采集并停止自动滚动"
+        case .crop: return state.cropping ? "取消裁剪 · 恢复完整长图" : "裁剪 · 拖动预览下边框以去掉多余内容"
+        case .cancel: return "取消长截图 · 放弃本次截图（Esc）"
+        case .save: return "另存为 · 选择图片或 PDF 的保存位置"
+        case .copy: return "完成复制 · 结束采集并复制到剪贴板"
+        }
+    }
+
+    private func button(_ action: Action, kind: AnnotationIconKind, title: String, target: CGFloat,
+                        selected: Bool = false, primary: Bool = false, disabled: Bool = false,
+                        perform: @escaping () -> Void) -> some View {
+        CaptureIconButton(kind: kind, title: title, help: help(action), selected: selected, primary: primary, target: target, action: perform)
+            .disabled(disabled)
+            .onHover { hovering in
+                if hovering { hoveredAction = action }
+                else if hoveredAction == action { hoveredAction = nil }
+            }
     }
 }
 

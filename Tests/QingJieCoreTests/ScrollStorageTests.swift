@@ -48,6 +48,35 @@ final class ScrollStorageTests: XCTestCase {
         let previewBytes = pixels(preview)
         XCTAssertTrue(stride(from: 3, to: previewBytes.count, by: 4).allSatisfy { previewBytes[$0] == 255 })
     }
+    func testBottomCropPreservesExactPrefixAndCanBeAdjustedOrResumed() throws {
+        for budget in [0, 1024 * 1024] {
+            let stitcher = try stitcher(budget: budget)
+            for offset in stride(from: 73, through: 730, by: 73) { _ = try stitcher.append(frame(offset)) }
+            for height in [1, 199, 200, 273, 389, 900, 930] {
+                let expected = frame(0, height: height)
+                XCTAssertEqual(pixels(try stitcher.compose(height: height)), pixels(expected))
+                let file = try stitcher.exportPNG(height: height)
+                XCTAssertEqual(pixels(try decode(file.url)), pixels(expected))
+                XCTAssertEqual(stitcher.totalHeight, 930)
+            }
+            XCTAssertEqual(try stitcher.append(frame(803)), .appended(73))
+            XCTAssertEqual(pixels(try stitcher.compose()), pixels(frame(0, height: 1003)))
+        }
+    }
+    func testBottomCropAppliesAppearanceAtTheNewEdgeAndRejectsInvalidHeights() throws {
+        let stitcher = try stitcher()
+        for offset in stride(from: 73, through: 730, by: 73) { _ = try stitcher.append(frame(offset)) }
+        let appearance = ScreenshotAppearance(roundedCorners: true, shadow: true)
+        let file = try stitcher.exportPNG(appearance: appearance, height: 511)
+        let actual = try decode(file.url), expected = try appearance.render(frame(0, height: 511))
+        XCTAssertEqual(actual.width, expected.width); XCTAssertEqual(actual.height, expected.height)
+        XCTAssertLessThanOrEqual(zip(pixels(actual), pixels(expected)).map { abs(Int($0) - Int($1)) }.max() ?? 0, 1)
+        for height in [-1, 0, 931] {
+            XCTAssertThrowsError(try stitcher.compose(height: height))
+            XCTAssertThrowsError(try stitcher.exportPNG(height: height))
+        }
+        XCTAssertEqual(stitcher.residentImageBytes, 0)
+    }
     func testBandedAppearanceMatchesWholeImageAtJoinsAndTransparentEdges() throws {
         let stitcher = try stitcher()
         for offset in stride(from: 73, through: 1460, by: 73) { _ = try stitcher.append(frame(offset)) }

@@ -22,6 +22,7 @@ enum SmokeTest {
         try checkDirectAnnotationEditing()
         try checkScreenshotSaving()
         try checkScreenshotAppearance()
+        try checkScrollCropPreview()
         try checkCaptureHistory()
         try checkMosaicStylesAndSampling()
         let source = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 240, pixelsHigh: 160, bitsPerSample: 8,
@@ -177,6 +178,9 @@ enum SmokeTest {
             try Raster.png(motionImage)!.write(to: url.appendingPathComponent("motion-layout-long.png"))
             if let hud = ScrollCaptureSession.renderHUDPreview(first: firstChrome) {
                 try Raster.png(hud)!.write(to: url.appendingPathComponent("scroll-hud-preview.png"))
+            }
+            if let hud = ScrollCaptureSession.renderHUDPreview(first: firstChrome, cropHeight: firstChrome.height * 3 / 4) {
+                try Raster.png(hud)!.write(to: url.appendingPathComponent("scroll-crop-preview.png"))
             }
             if let permission = PermissionHelpController.renderPreview() {
                 try Raster.png(permission)!.write(to: url.appendingPathComponent("permission-drag-preview.png"))
@@ -951,9 +955,113 @@ enum SmokeTest {
         }
     }
 
+    @MainActor private static func checkScrollCropPreview() throws {
+        let scroll = ScrollCropScrollView()
+        let host = NSWindow(contentRect: CGRect(x: 0, y: 0, width: 160, height: 220), styleMask: .borderless, backing: .buffered, defer: false)
+        host.isReleasedWhenClosed = false; host.contentView = scroll
+        defer { host.close() }
+        let view = scroll.crop
+        view.sourceSize = CGSize(width: 320, height: 640); view.retainedHeight = 640
+        var changed = 0; view.onChange = { changed = $0 }
+        scroll.layoutSubtreeIfNeeded(); scroll.layout()
+        func mouse(_ type: NSEvent.EventType, y: CGFloat) -> NSEvent {
+            NSEvent.mouseEvent(with: type, location: view.convert(CGPoint(x: 80, y: y), to: nil), modifierFlags: [],
+                              timestamp: 0, windowNumber: host.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+        }
+        let start = view.cutY + 4
+        view.mouseDown(with: mouse(.leftMouseDown, y: start))
+        view.mouseDragged(with: mouse(.leftMouseDragged, y: start - 60))
+        view.mouseUp(with: mouse(.leftMouseUp, y: start - 60))
+        try require(changed == 520, "拖动下边框按预览比例裁剪，不因抓取位置偏移而跳动")
+        view.moveBottom(to: -100); try require(changed == 1, "裁剪至少保留一行")
+        view.moveBottom(to: 10000); try require(changed == 640, "下边框可拖回原图底部以恢复内容")
+        view.enabled = false; view.moveBottom(to: 50)
+        try require(changed == 640, "导出期间下边框不可再次修改")
+    }
+
+    @MainActor private static func checkScrollCrop() async throws {
+        let source = recoveryFrame(offset: 0)
+        func crop(_ session: ScrollCaptureSession) async throws {
+            session.state.onCrop?()
+            for _ in 0..<100 {
+                if !session.state.preparingCrop { break }
+                try await Task.sleep(nanoseconds: 20_000_000)
+            }
+            try require(session.state.cropping && session.state.paused, "裁剪按钮暂停采集并进入预览调整")
+        }
+        let appearance = ScreenshotAppearance(roundedCorners: true, shadow: true)
+        var completed: CGImage?, captures = 0
+        let session = try ScrollCaptureSession(first: source, appearance: appearance, captureFrame: {
+            captures += 1; return recoveryFrame(offset: 3000)
+        }, onComplete: { completed = $0 })
+        try await crop(session); session.state.onCropChange?(321); session.finish()
+        for _ in 0..<100 {
+            if completed != nil { break }; try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let expected = try appearance.render(source.cropping(to: CGRect(x: 0, y: 0, width: 320, height: 321))!)
+        try require(completed != nil && Raster.png(completed!) == Raster.png(expected) && captures == 0,
+                    "拖动后直接完成复制，只输出保留部分并在新底边添加圆角阴影")
+
+        var copyHeights: [Int] = []
+        let disk = try ScrollCaptureSession(first: source, memoryBudget: 0, captureFrame: { source }, onCopiedPNG: { url in
+            if let data = try? Data(contentsOf: url), let image = NSBitmapImageRep(data: data) { copyHeights.append(image.pixelsHigh) }
+            return copyHeights.count == 2
+        }, onComplete: { _ in })
+        try await crop(disk); disk.state.onCropChange?(300); disk.finish()
+        for _ in 0..<100 {
+            if !copyHeights.isEmpty { break }; try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        disk.state.onCropChange?(420); disk.finish()
+        for _ in 0..<100 {
+            if copyHeights.count == 2 { break }; try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        try require(copyHeights == [300, 420], "磁盘长图复制失败后可重新调整底边，重试不复用旧裁剪")
+
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("QingJie-Crop-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        for format in ScreenshotFileFormat.allCases {
+            let saving = try ScrollCaptureSession(first: source, memoryBudget: format == .jpeg ? nil : 0,
+                                                 captureFrame: { source }, onComplete: { _ in })
+            try await crop(saving); saving.state.onCropChange?(200)
+            var writer: ((URL) async throws -> Void)?, callback: ((ScreenshotSaver.Outcome) -> Void)?
+            let present: ([ScreenshotFileFormat], @escaping (URL) async throws -> Void, @escaping (ScreenshotSaver.Outcome) -> Void) -> Void = {
+                _, write, complete in writer = write; callback = complete
+            }
+            saving.finish(saveAs: true, usingExport: present)
+            for _ in 0..<100 {
+                if writer != nil { break }; try await Task.sleep(nanoseconds: 20_000_000)
+            }
+            callback?(.cancelled); saving.state.onCropChange?(350); writer = nil
+            saving.finish(saveAs: true, usingExport: present)
+            for _ in 0..<100 {
+                if writer != nil { break }; try await Task.sleep(nanoseconds: 20_000_000)
+            }
+            guard let writer else { throw Failure(description: "裁剪保存写入器就绪") }
+            let url = root.appendingPathComponent("crop.\(format.suffix)")
+            try await writer(url); callback?(.saved(url))
+            if format == .pdf {
+                try require(CGPDFDocument(url as CFURL)?.numberOfPages == 1, "裁剪后的 PDF 不包含被裁掉的尾页")
+            } else {
+                let data = try Data(contentsOf: url)
+                try require(NSBitmapImageRep(data: data)?.pixelsHigh == 350, "\(format.suffix) 取消保存再调整时采用最新底边")
+            }
+        }
+        let resumed = try ScrollCaptureSession(first: source, captureFrame: { source }, onComplete: { _ in })
+        try await crop(resumed); resumed.state.onCropChange?(200); resumed.state.onCrop?()
+        try require(!resumed.state.cropping && resumed.state.outputHeight == 640, "取消裁剪恢复完整内容")
+        try await crop(resumed); resumed.state.onCropChange?(200); resumed.state.onPause?()
+        try require(!resumed.state.cropping && !resumed.state.paused && resumed.state.outputHeight == 640,
+                    "继续采集恢复原始长图，不把裁剪当作内容丢弃")
+        resumed.cancel()
+    }
+
     @MainActor static func runWorkerChecks() async throws {
+        try await checkScrollInputRouting()
+        try await checkScrollControls()
         try await checkScrollRecovery()
         try await checkPDFExport()
+        try await checkScrollCrop()
         let historyRoot = FileManager.default.temporaryDirectory.appendingPathComponent("QingJie-long-history-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: historyRoot, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: historyRoot) }

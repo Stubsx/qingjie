@@ -184,7 +184,7 @@ enum CaptureMode { case region, fullscreen }
         overlays.first(where: { $0.frame.contains(NSEvent.mouseLocation) })?.makeKey()
     }
 
-    private static func snapshotWindows() -> [CaptureWindow] {
+    static func snapshotWindows() -> [CaptureWindow] {
         guard let entries = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
                 as? [[String: Any]] else { return [] }
         return entries.compactMap { entry in

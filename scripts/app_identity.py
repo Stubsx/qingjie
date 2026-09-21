@@ -235,9 +235,18 @@ def build(install_after=True):
         info["QingJieInstallPath"] = value["installPath"]
         # 应用内更新用同一固定身份校验下载包；指纹来源仍是 AppIdentity.json。
         info["QingJieCertificateSHA1"] = fingerprint(value)
+        # Compile the editable Icon Composer document, including native appearance
+        # stacks for macOS 26 and the ICNS fallback for earlier supported systems.
+        icon_info = temporary / "AppIcon-Info.plist"
+        run(["xcrun", "actool", ROOT / "Resources/AppIcon.icon",
+             "--compile", staged / "Contents/Resources", "--platform", "macosx",
+             "--minimum-deployment-target", info["LSMinimumSystemVersion"],
+             "--app-icon", "AppIcon", "--output-partial-info-plist", icon_info])
+        info.update(plistlib.loads(icon_info.read_bytes()))
+        for name in ("Assets.car", "AppIcon.icns"):
+            if not (staged / "Contents/Resources" / name).is_file():
+                raise RuntimeError(f"Icon Composer 图标编译缺少 {name}。")
         (staged / "Contents/Info.plist").write_bytes(plistlib.dumps(info))
-        run(["swift", ROOT / "scripts/icon.swift", temporary])
-        run(["/usr/bin/iconutil", "-c", "icns", temporary / "AppIcon.iconset", "-o", staged / "Contents/Resources/AppIcon.icns"])
         sign(staged)
         publish_directory(staged, destination)
     if not install_after:

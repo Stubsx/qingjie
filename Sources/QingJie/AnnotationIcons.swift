@@ -2,7 +2,7 @@ import SwiftUI
 
 /// One 20-point drawing grid and stroke for every action in the capture toolbar.
 enum AnnotationIconKind {
-    case tool(MarkTool), undo, redo, eyedropper, close, save, scrolling, reselect, copy, confirm, pause, resume, advance
+    case tool(MarkTool), undo, redo, eyedropper, close, save, scrolling, reselect, copy, confirm, pause, resume, advance, autoScroll
 }
 
 struct AnnotationIcon: View {
@@ -80,6 +80,9 @@ private struct AnnotationIconShape: Shape {
             line([p(5, 3), p(17, 10), p(5, 17)], closed: true)
         case .advance:
             line([p(10, 3), p(10, 17)]); line([p(4, 11), p(10, 17), p(16, 11)])
+        case .autoScroll:
+            line([p(5, 4), p(10, 9), p(15, 4)])
+            line([p(5, 11), p(10, 16), p(15, 11)])
         }
         return path.applying(CGAffineTransform(scaleX: rect.width / 20, y: rect.height / 20)
             .concatenating(CGAffineTransform(translationX: rect.minX, y: rect.minY)))
@@ -109,11 +112,13 @@ struct CaptureIconButton: View {
     let kind: AnnotationIconKind
     let title: String
     var help: String? = nil
+    var selected = false
     var primary = false
+    var target: CGFloat = 36
     let action: () -> Void
     var body: some View {
         Button(action: action) { AnnotationIcon(kind: kind) }
-            .buttonStyle(AnnotationIconButtonStyle(primary: primary))
+            .buttonStyle(AnnotationIconButtonStyle(selected: selected, primary: primary, target: target))
             .accessibilityLabel(title).help(help ?? title)
     }
 }

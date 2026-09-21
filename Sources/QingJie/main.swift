@@ -16,6 +16,13 @@ import QingJieCore
     var captureMenuItems: [(NSMenuItem, CaptureShortcutAction, String)] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if CommandLine.arguments.contains("--scroll-input-check") {
+            Task {
+                do { try await SmokeTest.checkScrollInputRouting(); print("SCROLL INPUT CHECK PASSED"); NSApp.terminate(nil) }
+                catch { fputs("SCROLL INPUT CHECK FAILED: \(error)\n", stderr); exit(1) }
+            }
+            return
+        }
         if CommandLine.arguments.contains("--smoke-test") { runSmokeTest(); return }
         if let identifier = Bundle.main.bundleIdentifier,
            let existing = NSRunningApplication.runningApplications(withBundleIdentifier: identifier)
@@ -231,7 +238,7 @@ final class PinnedImageView: NSImageView {
 
 MainActor.assumeIsolated {
     let app = NSApplication.shared
-    let delegate = AppDelegate()
+    let delegate: NSApplicationDelegate = CommandLine.arguments.contains("--scroll-input-fixture") ? ScrollInputFixture() : AppDelegate()
     app.delegate = delegate
     withExtendedLifetime(delegate) { app.run() }
 }
