@@ -42,8 +42,10 @@ def run(args, capture=True):
 
 def config():
     value = json.loads(CONFIG.read_text())
-    if value["signingProfile"] != "local":
-        raise RuntimeError("当前脚本只支持已固定的本机签名；正式发布需明确配置 Developer ID 身份。")
+    if value["signingProfile"] not in ("local", "developer-id"):
+        raise RuntimeError("不支持的签名身份。")
+    if value["signingProfile"] == "developer-id" and not re.fullmatch(r"[A-Z0-9]{10}", value.get("teamIdentifier", "")):
+        raise RuntimeError("Developer ID 必须固定 Apple 团队。")
     if not re.fullmatch(r"[A-Za-z0-9.-]+", value["bundleIdentifier"]):
         raise RuntimeError("无效的 Bundle ID。")
     return value
@@ -57,7 +59,10 @@ def fingerprint(value):
 
 
 def requirement(value):
-    return f'identifier "{value["bundleIdentifier"]}" and certificate leaf = H"{fingerprint(value)}"'
+    rule = f'identifier "{value["bundleIdentifier"]}" and certificate leaf = H"{fingerprint(value)}"'
+    if value["signingProfile"] == "developer-id":
+        rule += f' and anchor apple generic and certificate leaf[subject.OU] = "{value["teamIdentifier"]}" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists'
+    return rule
 
 
 def check_bundle(app, value):
@@ -87,6 +92,12 @@ def verify(app, value=None):
 
 def check_signer(value):
     sha1 = fingerprint(value)
+    if value["signingProfile"] == "developer-id":
+        identities = run(["/usr/bin/security", "find-identity", "-v", "-p", "codesigning"])
+        expected = f'{sha1} "{value["certificateName"]}"'
+        if expected not in identities:
+            raise RuntimeError("固定 Developer ID 证书及私钥不可用；请恢复原身份，不会自动创建替代证书。")
+        return sha1, None
     if not KEYCHAIN.is_file() or not PASSWORD.is_file():
         raise RuntimeError("固定签名的钥匙串或密码文件缺失。请恢复 Signing 目录的备份；不会自动生成另一张证书。")
     password = PASSWORD.read_text().strip()
@@ -98,6 +109,13 @@ def sign(app):
     value = config()
     check_bundle(app, value)
     sha1, password = check_signer(value)
+    if value["signingProfile"] == "developer-id":
+        run(["/usr/bin/codesign", "--force", "--sign", sha1,
+             "--identifier", value["bundleIdentifier"], "--options", "runtime", "--timestamp",
+             "--requirements", "=designated => " + requirement(value), app])
+        verify(app, value)
+        print(f"Developer ID 固定签名验证通过：{app}")
+        return
     with (SIGNING / "signing.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         current = shlex.split(run(["/usr/bin/security", "list-keychains", "-d", "user"]))
@@ -123,6 +141,8 @@ def sign(app):
 
 def init_local():
     value = config()
+    if value["signingProfile"] != "local":
+        raise RuntimeError("已迁移 Developer ID，禁止生成本机替代身份。")
     if value.get("certificateSHA1"):
         check_signer(value)
         print("已固定本机证书；保留现有身份，不重新生成。")
@@ -235,6 +255,9 @@ def build(install_after=True):
         info["QingJieInstallPath"] = value["installPath"]
         # 应用内更新用同一固定身份校验下载包；指纹来源仍是 AppIdentity.json。
         info["QingJieCertificateSHA1"] = fingerprint(value)
+        info["QingJieSigningProfile"] = value["signingProfile"]
+        if value["signingProfile"] == "developer-id":
+            info["QingJieTeamIdentifier"] = value["teamIdentifier"]
         # Compile the editable Icon Composer document, including native appearance
         # stacks for macOS 26 and the ICNS fallback for earlier supported systems.
         icon_info = temporary / "AppIcon-Info.plist"
@@ -260,7 +283,7 @@ def build(install_after=True):
     print(f"已构建并替换当前安装：{value['installPath']}")
 
 
-def install():
+def install(migrate_local=False):
     value = config()
     source = ROOT / "dist" / (value["appName"] + ".app")
     destination = Path(value["installPath"])
@@ -270,7 +293,21 @@ def install():
     if destination.is_symlink():
         raise RuntimeError("固定安装位置是符号链接，请先检查，安装已停止。")
     if destination.exists():
-        verify(destination, value)
+        try:
+            verify(destination, value)
+        except RuntimeError:
+            previous = value.get("previousLocalIdentity", {})
+            if not migrate_local or value["signingProfile"] != "developer-id" or previous.get("signingProfile") != "local":
+                raise
+            verify(destination, {**value, **previous})
+            backup = SIGNING / "migration-backup" / destination.name
+            if backup.exists():
+                verify(backup, {**value, **previous})
+            else:
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                run(["/usr/bin/ditto", destination, backup])
+                verify(backup, {**value, **previous})
+            print("已完整验证并备份旧本机签名应用；此次安装明确迁移到 Developer ID。")
     with tempfile.TemporaryDirectory(prefix=".qingjie-install-", dir=destination.parent) as directory:
         staged = Path(directory) / destination.name
         run(["/usr/bin/ditto", source, staged])
@@ -295,7 +332,33 @@ def package():
             if bundle.testzip() is not None:
                 raise RuntimeError("压缩包完整性检查失败。")
         staged.replace(archive)
-    print(f"本机签名版已打包并验证：{archive}")
+    print(f"固定签名版已打包并验证：{archive}")
+
+
+def notarize():
+    value = config()
+    if value["signingProfile"] != "developer-id":
+        raise RuntimeError("Apple 公证需要 Developer ID Application。")
+    app = ROOT / "dist" / (value["appName"] + ".app")
+    verify(app, value)
+    profile = value.get("notaryProfile", "qingjie-notary")
+    credential_args = ["--keychain-profile", profile]
+    if os.environ.get("QINGJIE_NOTARY_KEYCHAIN"):
+        credential_args += ["--keychain", os.environ["QINGJIE_NOTARY_KEYCHAIN"]]
+    # Read-only authentication probe before creating/uploading the archive.
+    run(["xcrun", "notarytool", "history", *credential_args, "--output-format", "json"])
+    package()
+    result = json.loads(run(["xcrun", "notarytool", "submit", archive_path(value),
+                             *credential_args, "--wait", "--output-format", "json"]))
+    (app.parent / "notarization-result.json").write_text(json.dumps(result, indent=2) + "\n")
+    if result.get("status") != "Accepted":
+        raise RuntimeError(f"Apple 公证未通过：{result.get('status')}，提交 ID：{result.get('id')}")
+    run(["xcrun", "stapler", "staple", app])
+    run(["xcrun", "stapler", "validate", app])
+    verify(app, value)
+    run(["/usr/sbin/spctl", "--assess", "--type", "execute", "--verbose=2", app])
+    package()
+    print("Apple 公证、票据附加与 Gatekeeper 检查通过；已重新生成可分发 ZIP。")
 
 
 def archive_path(value):
@@ -384,6 +447,13 @@ def feed(args):
     if not archive.is_file():
         raise RuntimeError("缺少发布压缩包；请先运行 python3 scripts/app_identity.py package。")
     verify_package(archive, app, value)
+    if value["signingProfile"] == "developer-id":
+        run(["xcrun", "stapler", "validate", app])
+        run(["/usr/sbin/spctl", "--assess", "--type", "execute", "--verbose=2", app])
+        # The downloadable archive must also carry its notarization ticket.
+        with tempfile.TemporaryDirectory(prefix="qingjie-release-notary-") as directory:
+            run(["/usr/bin/ditto", "-x", "-k", archive, directory])
+            run(["xcrun", "stapler", "validate", Path(directory) / app.name])
     if args.github_repo:
         args.package_url, args.release_url = release_assets(args, value)
     if not args.package_url or not args.package_url.startswith("https://"):
@@ -429,13 +499,14 @@ def publish(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["init-local", "build", "sign", "verify", "install", "package", "feed", "publish", "status"])
+    parser.add_argument("command", choices=["init-local", "build", "sign", "verify", "install", "package", "feed", "publish", "status", "notarize"])
     parser.add_argument("app", nargs="?", type=Path)
     parser.add_argument("--package-url", help="更新压缩包的 https 下载地址（feed/publish）")
     parser.add_argument("--release-url", help="发布页地址，可选（feed/publish）")
     parser.add_argument("--notes", help="更新说明，可选（feed/publish）")
     parser.add_argument("--github-repo", help="用 gh CLI 上传压缩包到该仓库的 Release，形如 owner/name（feed/publish）")
     parser.add_argument("--tag", help="Release 标签，默认 v<版本号>（配合 --github-repo）")
+    parser.add_argument("--migrate-local", action="store_true", help="仅 install：验证并备份固定旧身份后迁移到 Developer ID")
     parser.add_argument("--no-install", action="store_true", help="仅构建 dist 成品，不替换 /Applications 安装")
     args = parser.parse_args()
     if args.command in ("sign", "verify") and args.app is None:
@@ -444,7 +515,8 @@ def main():
     elif args.command == "build": build(install_after=not args.no_install)
     elif args.command == "sign": sign(args.app.resolve())
     elif args.command == "verify": print(verify(args.app.resolve()))
-    elif args.command == "install": install()
+    elif args.command == "install": install(migrate_local=args.migrate_local)
+    elif args.command == "notarize": notarize()
     elif args.command == "package": package()
     elif args.command == "feed": feed(args)
     elif args.command == "publish": publish(args)

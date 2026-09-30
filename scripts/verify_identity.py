@@ -48,6 +48,14 @@ def main():
         rejected(lambda: verify(unsigned))
         print("PASS: 未签名应用不能冒用同名身份")
 
+        if value["signingProfile"] == "developer-id":
+            rejected(lambda: verify(apps[1], {**value, "teamIdentifier": "AAAAAAAAAA"}))
+            rejected(lambda: verify(apps[1], {**value, "certificateSHA1": "0" * 40}))
+            previous = value.get("previousLocalIdentity")
+            if previous:
+                rejected(lambda: verify(apps[1], {**value, **previous}))
+            print("PASS: 错误团队、错误证书及旧本机身份均不能接受 Developer ID 应用")
+
         altered = temporary / "altered.app"
         shutil.copytree(apps[1], altered)
         with (altered / "Contents/MacOS" / value["executable"]).open("ab") as file:

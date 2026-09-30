@@ -9,3 +9,6 @@ __pycache__/
 *.pfx
 *.keychain-db
 *.key
+
+# App Store Connect API private keys
+*.p8

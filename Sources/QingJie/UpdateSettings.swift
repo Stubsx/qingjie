@@ -86,7 +86,13 @@ final class UpdateSettings: ObservableObject {
         guard let sha1 = Bundle.main.object(forInfoDictionaryKey: "QingJieCertificateSHA1") as? String,
               sha1.range(of: #"^[A-F0-9]{40}$"#, options: .regularExpression) != nil,
               let identifier = Bundle.main.bundleIdentifier else { return nil }
-        return "identifier \"\(identifier)\" and certificate leaf = H\"\(sha1)\""
+        var rule = "identifier \"\(identifier)\" and certificate leaf = H\"\(sha1)\""
+        if Bundle.main.object(forInfoDictionaryKey: "QingJieSigningProfile") as? String == "developer-id" {
+            guard let team = Bundle.main.object(forInfoDictionaryKey: "QingJieTeamIdentifier") as? String,
+                  team.range(of: #"^[A-Z0-9]{10}$"#, options: .regularExpression) != nil else { return nil }
+            rule += " and anchor apple generic and certificate leaf[subject.OU] = \"\(team)\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"
+        }
+        return try? run("/usr/bin/csreq", ["-r", "=" + rule, "-t"]).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     static var installDestination: URL {
